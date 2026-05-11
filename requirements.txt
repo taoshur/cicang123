@@ -1,0 +1,29 @@
+# 磁场监测系统 - Python依赖
+# 安装命令: pip install -r requirements.txt
+
+# Web框架
+flask>=2.0.0
+flask-socketio>=5.0.0
+flask-cors>=4.0.0
+eventlet>=0.33.0  # 用于SocketIO高性能模式
+
+# 数值计算与推理
+numpy>=1.21.0
+onnxruntime>=1.16.0
+
+# 网络请求
+requests>=2.25.0
+
+# 网络接口
+netifaces>=0.11.0  # 用于获取网络接口信息
+
+# WSGI服务器
+waitress>=2.0.0
+
+# 串口通信
+pyserial>=3.5.0
+
+# 可选依赖（用于数据存储和分析）
+# numpy>=1.21.0
+# pandas>=1.3.0
+# sqlite3  # Python内置
