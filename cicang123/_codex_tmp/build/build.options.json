@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "D:\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.8-cn,D:\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.8-cn",
+  "otherLibrariesFolders": "C:\\Users\\回来\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\回来\\Desktop\\cicang123\\cicang123\\_codex_tmp\\CiChang2_BLE"
+}

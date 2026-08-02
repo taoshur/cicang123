@@ -1,0 +1,36 @@
+{
+  "version": "2.0",
+  "envId": "xingya-d7guuazahac96fea3",
+  "framework": {
+    "name": "magnetic-detection",
+    "plugins": {
+      "container": {
+        "use": "@cloudbase/framework-plugin-container",
+        "inputs": {
+          "serviceName": "magnetic-detection",
+          "servicePath": "/",
+          "localPath": "./",
+          "uploadType": "package",
+          "dockerfilePath": "./Dockerfile",
+          "containerPort": 8080,
+          "isPublic": true,
+          "mode": "low-cost",
+          "cpu": 0.5,
+          "mem": 1,
+          "minNum": 0,
+          "maxNum": 3,
+          "envVariables": {
+            "PORT": "8080",
+            "WEB_PORT": "8080",
+            "DEPLOY_TARGET": "cloudbase-run",
+            "MODEL_PATH": "sensor_cnn/web/plate_model.onnx"
+          },
+          "initialDelaySeconds": 20
+        }
+      }
+    }
+  },
+  "cloudrun": {
+    "name": "magnetic-detection"
+  }
+}

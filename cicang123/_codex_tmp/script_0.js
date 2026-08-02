@@ -1,0 +1,6469 @@
+﻿
+        // 页面切换功能
+        function showPage(pageId, event) {
+            // 隐藏所有页面
+            const pages = document.querySelectorAll('.page-content');
+            pages.forEach(page => {
+                page.classList.remove('active');
+            });
+            
+            // 移除所有导航按钮的active状态
+            const tabs = document.querySelectorAll('.nav-tab');
+            tabs.forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // 显示选中的页面
+            document.getElementById(pageId).classList.add('active');
+            
+            // 激活对应的导航按钮
+            if (event && event.target) {
+                event.target.classList.add('active');
+            }
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+        
+        // Magnetic monitor initialization starts after Chart.js and Socket.IO finish loading.
+        
+        // 磁场监控功能的JavaScript代码
+        class MagneticMonitor {
+            constructor() {
+                console.log('开始初始化 MagneticMonitor...');
+                this.dataBuffer = '';
+                
+                // 蓝牙相关变量 - 支持多设备
+                this.bluetoothDevices = []; // 存储多个蓝牙设备
+                this.bluetoothCharacteristics = {}; // 设备ID到特性的映射
+                this.isBluetoothConnected = false;
+                this.bluetoothLineBuffers = {}; // BLE通知分片缓存，按设备独立保存
+                
+                // 设备数据存储 - 为每个设备存储独立的数据
+                this.deviceData = {}; // 设备ID到数据的映射
+                this.currentSelectedSensor = 'all'; // 当前选中的传感器，默认为显示所有传感器
+                this.currentSelectedDevice = null; // 当前选中的设备
+                this.connectedSensors = 0; // 当前连接的传感器数量
+                
+                // 连接状态管理 - 支持多连接
+                this.connections = {
+                    'esp32-bluetooth': { connected: false, connecting: false, devices: [] },
+                    'esp32-network': { connected: false, connecting: false },
+                    'network': { connected: false, connecting: false },
+                    'esp32': { connected: false, connecting: false } // ESP32 WebSocket连接
+                };
+                
+                // 数据接收状态
+                this.isReceivingData = false;
+                
+                // 连接状态锁，防止并发操作
+                this.isConnecting = false;
+                this.isDisconnecting = false;
+                
+                // 连接状态检查定时器
+                this.connectionCheckInterval = null;
+                
+                // 添加点击事件监听器，点击页面其他地方时关闭下拉菜单
+                document.addEventListener('click', (event) => {
+                    const dropdown = document.getElementById('sensorDropdown');
+                    const dropdownButton = document.querySelector('.device-btn');
+                    
+                    if (dropdown && dropdown.style.display === 'block' && 
+                        !dropdown.contains(event.target) && 
+                        !dropdownButton.contains(event.target)) {
+                        dropdown.style.display = 'none';
+                    }
+                });
+                
+                // WebSocket相关变量
+                this.socket = null;
+                this.esp32Sockets = []; // 支持多个ESP32 WebSocket连接
+                this.esp32BluetoothDevices = []; // 支持多个ESP32蓝牙设备
+                this.reconnectTimer = null; // 重连定时器
+
+                this.esp32NetworkDevices = {};
+                
+                // 调试标志
+                this.debugMode = false; // 设置为true开启详细日志
+                
+                // DOM元素缓存（减少重复查询）- 延迟到DOM加载完成后初始化
+                this.domElements = {};
+                
+                // 数据存储
+                this.memoryPolicy = {
+                    maxSeriesPoints: 50,
+                    maxChartPoints: 50,
+                    maxLogEntries: 80,
+                    maxDisconnectedDeviceAgeMs: 300000
+                };
+                this.maxDataPoints = this.memoryPolicy.maxSeriesPoints;
+                this.timeLabels = [];
+                this.xData = [];
+                this.yData = [];
+                this.zData = [];
+                
+                // 当前值
+                this.currentValues = { x: 0, y: 0, z: 0 };
+                
+                // 传感器映射设置 - 用户可以自定义物理传感器对应哪个显示位置
+                this.sensorDisplayMapping = {
+                    display1: null,
+                    display2: null,
+                    display3: null
+                };
+                
+                // 数据点间隔控制
+                this.lastDataTime = 0;
+                this.dataInterval = 200; // 数据点间隔（毫秒）
+                
+                // 警告定时器
+                this.warningTimer = null;
+                
+
+
+                
+                // 日志系统优化
+                this.lastLogTime = 0;
+                
+                // ESP32连接优化
+                this.esp32ReconnectAttempts = 0;
+                this.maxReconnectAttempts = 5;
+                this.esp32ReconnectTimer = null;
+                this.esp32HeartbeatTimer = null;
+                this.esp32HeartbeatInterval = 30000; // 30秒心跳间隔
+                this.esp32BluetoothTimer = null; // 蓝牙定时器
+                
+                console.log('初始化图表...');
+                this.initChart();
+                console.log('绑定事件...');
+                this.bindEvents();
+                console.log('初始化连接设置...');
+                this.initConnectionSettings();
+                console.log('MagneticMonitor 初始化完成');
+            }
+            
+            initConnectionSettings() {
+                console.log('开始初始化连接设置...');
+                
+                // 确保DOM完全加载
+                if (document.readyState !== 'complete') {
+                    console.log('DOM尚未完全加载，等待...');
+                    setTimeout(() => this.initConnectionSettings(), 100);
+                    return;
+                }
+                
+                // DOM加载完成后，初始化DOM元素缓存
+                this.cacheDomElements();
+                
+                // 初始化连接设置
+                const connectionTypeSelect = this.getDomElement('connectionType');
+                if (!connectionTypeSelect) {
+                    console.error('未找到连接类型选择器');
+                    return;
+                }
+                
+                const connectionType = connectionTypeSelect.value;
+                console.log('当前连接类型:', connectionType);
+                
+                this.handleConnectionTypeChange(connectionType);
+                console.log('连接设置初始化完成');
+                
+                // 自动连接到服务器（异步，不阻塞其他功能）
+                this.autoConnectToServer().catch(err => {
+                    console.log('自动连接到服务器失败，但不影响其他功能:', err);
+                });
+            }
+            
+            async autoConnectToServer() {
+                try {
+                    console.log('开始自动连接到服务器...');
+
+                    // 检查后端服务是否可用
+                    this.addLog('🔌 正在尝试连接后端服务...', 'info');
+
+                    const pageProtocol = window.location.protocol === 'https:' ? 'https' : 'http';
+                    let protocol = pageProtocol;
+
+                    this.setDefaultCloudServerUrl();
+
+                    const response = await fetch(`/healthz`, { cache: 'no-store' });
+                    if (response.ok) {
+                        console.log('后端服务在线，开始建立Socket.IO连接');
+                        this.addLog(`✅ 后端服务在线 (${protocol})`, 'success');
+
+                        const serverStatusElement = document.getElementById('serverConnectionStatus');
+                        if (serverStatusElement) {
+                            serverStatusElement.style.background = '#fff3cd';
+                            serverStatusElement.style.color = '#856404';
+                            serverStatusElement.style.borderColor = '#ffeaa7';
+                            serverStatusElement.textContent = `后端服务在线，正在连接实时通道...`;
+                        }
+
+                        await this.connectWebSocket();
+                        return;
+                    }
+                    
+                    throw new Error(`后端服务不可用`);
+                    
+                } catch (error) {
+                    console.log('自动连接失败:', error);
+                    
+                    // 更新连接状态
+                    if (this.connections.network) {
+                        this.connections.network.connected = false;
+                        this.connections.network.connecting = false;
+                    }
+                    
+                    // 更新服务器连接状态显示
+                    const serverStatusElement = document.getElementById('serverConnectionStatus');
+                    if (serverStatusElement) {
+                        serverStatusElement.style.background = '#f8d7da';
+                        serverStatusElement.style.color = '#721c24';
+                        serverStatusElement.style.borderColor = '#f5c6cb';
+                        serverStatusElement.textContent = '❌ 后端服务连接失败';
+                    }
+                    
+                    // 记录错误
+                    this.addLog(`❌ 自动连接失败: ${error.message}`, 'error');
+                    
+                    // 不抛出异常，允许其他功能继续运行
+                }
+            }
+            
+            showDetailedHelp() {
+                // 显示详细帮助信息（预留接口）
+                console.log('显示详细帮助（预留接口）');
+            }
+            
+            initChart() {
+                // 初始化磁场数据图表
+                this.initMagneticDataChart();
+                // 初始化仪表盘
+                this.initGauges();
+            }
+            
+            initMagneticDataChart() {
+                const ctx = document.getElementById('magneticDataChart');
+                if (!ctx) {
+                    console.warn('未找到磁场数据图表容器');
+                    return;
+                }
+
+                if (typeof Chart === 'undefined') {
+                    console.warn('Chart.js未加载，磁场数据图表不可用');
+                    // 显示占位符
+                    ctx.style.display = 'none';
+                    const parent = ctx.parentElement;
+                    if (parent) {
+                        const placeholder = document.createElement('div');
+                        placeholder.style.cssText = 'display: flex; align-items: center; justify-content: center; height: 100%; color: #999; font-size: 14px; background: rgba(0,0,0,0.02); border-radius: 8px;';
+                        placeholder.textContent = '⚠️ Chart.js库加载失败，请检查网络连接';
+                        parent.appendChild(placeholder);
+                    }
+                    return;
+                }
+
+                // 确保canvas有正确的宽度和高度属性
+                const parent = ctx.parentElement;
+                if (parent) {
+                    const rect = parent.getBoundingClientRect();
+                    ctx.width = rect.width;
+                    ctx.height = rect.height;
+                }
+
+                this.magneticDataChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [
+                            {
+                                label: 'X轴',
+                                data: [],
+                                borderColor: '#f97316',
+                                backgroundColor: 'rgba(255, 0, 0, 0.15)',
+                                borderWidth: 3,
+                                fill: true,
+                                tension: 0.4,
+                                pointRadius: 0,
+                                pointHoverRadius: 6,
+                                pointHoverBackgroundColor: '#f97316'
+                            },
+                            {
+                                label: 'Y轴',
+                                data: [],
+                                borderColor: '#22c55e',
+                                backgroundColor: 'rgba(0, 204, 0, 0.15)',
+                                borderWidth: 3,
+                                fill: true,
+                                tension: 0.4,
+                                pointRadius: 0,
+                                pointHoverRadius: 6,
+                                pointHoverBackgroundColor: '#22c55e'
+                            },
+                            {
+                                label: 'Z轴',
+                                data: [],
+                                borderColor: '#38bdf8',
+                                backgroundColor: 'rgba(0, 102, 255, 0.15)',
+                                borderWidth: 3,
+                                fill: true,
+                                tension: 0.4,
+                                pointRadius: 0,
+                                pointHoverRadius: 6,
+                                pointHoverBackgroundColor: '#38bdf8'
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: {
+                            duration: 0
+                        },
+                        interaction: {
+                            intersect: false,
+                            mode: 'index'
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                position: 'top',
+                                labels: {
+                                    color: '#666',
+                                    font: {
+                                        size: 12
+                                    },
+                                    padding: 15,
+                                    usePointStyle: true
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: '实时磁场数据可视化',
+                                color: '#333',
+                                font: {
+                                    size: 14,
+                                    weight: 'bold'
+                                },
+                                padding: 10
+                            },
+                            tooltip: {
+                                enabled: true,
+                                backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                titleColor: '#fff',
+                                bodyColor: '#fff',
+                                borderColor: '#ddd',
+                                borderWidth: 1,
+                                cornerRadius: 8,
+                                padding: 10,
+                                callbacks: {
+                                    label: function(context) {
+                                        return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} mT`;
+                                    }
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                display: true,
+                                title: {
+                                    display: true,
+                                    text: '时间',
+                                    color: '#666'
+                                },
+                                grid: {
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                },
+                                ticks: {
+                                    maxTicksLimit: 10,
+                                    color: '#666',
+                                    font: {
+                                        size: 11
+                                    }
+                                }
+                            },
+                            y: {
+                                display: true,
+                                title: {
+                                    display: true,
+                                    text: '磁场强度 (mT)',
+                                    color: '#666'
+                                },
+                                grid: {
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                },
+                                ticks: {
+                                    color: '#666',
+                                    font: {
+                                        size: 11
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                console.log('磁场数据图表初始化成功');
+            }
+            
+            initGauges() {
+                // 初始化三个仪表盘
+                this.xGaugeChart = this.createGauge('xGauge', '#f97316');
+                this.yGaugeChart = this.createGauge('yGauge', '#22c55e');
+                this.zGaugeChart = this.createGauge('zGauge', '#38bdf8');
+            }
+            
+            createGauge(canvasId, color) {
+                const ctx = document.getElementById(canvasId);
+                if (!ctx) {
+                    console.warn(`未找到仪表盘容器: ${canvasId}`);
+                    return null;
+                }
+                
+                if (typeof Chart === 'undefined') {
+                    console.warn('Chart.js未加载，仪表盘不可用');
+                    return null;
+                }
+                
+                return new Chart(ctx, {
+                    type: 'doughnut',
+                    data: {
+                        datasets: [{
+                            data: [0, 100],
+                            backgroundColor: [color, '#e0e0e0'],
+                            borderWidth: 0,
+                            circumference: 180,
+                            rotation: 270
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        cutout: '75%',
+                        plugins: {
+                            legend: {
+                                display: false
+                            },
+                            tooltip: {
+                                enabled: false
+                            }
+                        }
+                    },
+                    plugins: [{
+                        id: 'centerText',
+                        afterDraw: (chart) => {
+                            const { ctx, chartArea: { width, height } } = chart;
+                            ctx.save();
+                            
+                            // 检查是否有实际值存储在chart对象中，并且是有效数字
+                            const actualValue = chart._actualValue;
+                            if (actualValue !== undefined && !isNaN(actualValue)) {
+                                const text = actualValue.toFixed(2) + ' mT';
+                                ctx.font = 'bold 24px Arial';
+                                ctx.fillStyle = '#333';
+                                ctx.textAlign = 'center';
+                                ctx.fillText(text, width / 2, height - 20);
+                            } else {
+                                const text = '0.00 mT';
+                                ctx.font = 'bold 24px Arial';
+                                ctx.fillStyle = '#333';
+                                ctx.textAlign = 'center';
+                                ctx.fillText(text, width / 2, height - 20);
+                            }
+                            
+                            ctx.restore();
+                        }
+                    }]
+                });
+            }
+            
+            updateMagneticDataChart(x, y, z, deviceName = 'ESP32', deviceId = 'unknown', sensorId = 'sensor1') {
+                if (!this.magneticDataChart) return;
+
+                if (this.currentSelectedDevice && this.currentSelectedDevice !== deviceId) {
+                    return;
+                }
+
+                // 只有当当前选中的是全部传感器或当前传感器时，才更新图表
+                if (this.currentSelectedSensor === 'all' || this.currentSelectedSensor === sensorId) {
+                    const now = new Date();
+                    const timeLabel = now.toLocaleTimeString();
+
+                    // 添加新数据点
+                    this.magneticDataChart.data.labels.push(timeLabel);
+                    this.magneticDataChart.data.datasets[0].data.push(x);
+                    this.magneticDataChart.data.datasets[1].data.push(y);
+                    this.magneticDataChart.data.datasets[2].data.push(z);
+
+                    this.trimChartData(this.magneticDataChart);
+
+                    // 更新图表标题，显示当前传感器
+                    let title = `实时磁场数据可视化`;
+                    if (this.currentSelectedDevice) {
+                        const selected = this.deviceData[this.currentSelectedDevice];
+                        const selectedName = selected ? selected.name : this.currentSelectedDevice;
+                        title += ` (${selectedName})`;
+                    } else if (this.currentSelectedSensor !== 'all') {
+                        title += ` (${this.currentSelectedSensor})`;
+                    }
+                    this.magneticDataChart.options.plugins.title.text = title;
+
+                    this.magneticDataChart.update('none');
+                }
+            }
+
+            updateGauges(x, y, z, deviceId = 'unknown') {
+                if (this.currentSelectedDevice && this.currentSelectedDevice !== deviceId) {
+                    return;
+                }
+                const maxValue = 30;
+                
+                if (this.xGaugeChart) {
+                    // 计算百分比，确保在0-100之间
+                    const xPercent = Math.min(Math.max(Math.abs(x) / maxValue * 100, 0), 100);
+                    this.xGaugeChart.data.datasets[0].data = [xPercent, 100 - xPercent];
+                    // 存储实际值到chart对象中
+                    this.xGaugeChart._actualValue = x;
+                    this.xGaugeChart.update('none');
+                }
+                
+                if (this.yGaugeChart) {
+                    // 计算百分比，确保在0-100之间
+                    const yPercent = Math.min(Math.max(Math.abs(y) / maxValue * 100, 0), 100);
+                    this.yGaugeChart.data.datasets[0].data = [yPercent, 100 - yPercent];
+                    // 存储实际值到chart对象中
+                    this.yGaugeChart._actualValue = y;
+                    this.yGaugeChart.update('none');
+                }
+                
+                if (this.zGaugeChart) {
+                    // 计算百分比，确保在0-100之间
+                    const zPercent = Math.min(Math.max(Math.abs(z) / maxValue * 100, 0), 100);
+                    this.zGaugeChart.data.datasets[0].data = [zPercent, 100 - zPercent];
+                    // 存储实际值到chart对象中
+                    this.zGaugeChart._actualValue = z;
+                    this.zGaugeChart.update('none');
+                }
+            }
+            
+            bindEvents() {
+                console.log('开始绑定事件...');
+                
+                // 检查元素是否存在
+                const magneticConnectBtn = document.getElementById('magneticConnectBtn');
+                const magneticDisconnectBtn = document.getElementById('magneticDisconnectBtn');
+                const magneticClearBtn = document.getElementById('magneticClearBtn');
+                const connectionTypeSelect = document.getElementById('connectionType');
+                
+                console.log('按钮元素检查结果:', {
+                    magneticConnectBtn: !!magneticConnectBtn,
+                    magneticDisconnectBtn: !!magneticDisconnectBtn,
+                    magneticClearBtn: !!magneticClearBtn,
+                    connectionTypeSelect: !!connectionTypeSelect
+                });
+                
+                // 云端服务地址按钮事件
+                const useCurrentServerBtn = document.getElementById('useCurrentServerBtn');
+                if (useCurrentServerBtn) {
+                    useCurrentServerBtn.addEventListener('click', () => {
+                        this.setDefaultCloudServerUrl(true);
+                    });
+                    console.log('云端服务地址按钮事件绑定成功');
+                }
+                
+
+                
+                // 连接方式选择器事件
+                if (connectionTypeSelect) {
+                    connectionTypeSelect.addEventListener('change', (e) => {
+                        this.handleConnectionTypeChange(e.target.value);
+                    });
+                    console.log('连接方式选择器事件绑定成功');
+                }
+                
+                if (magneticConnectBtn) {
+                    // 使用箭头函数确保this指向正确
+                    const self = this;
+                    magneticConnectBtn.addEventListener('click', async function(event) {
+                        console.log('========================================');
+                        console.log('连接设备按钮被点击!');
+                        console.log('事件对象:', event);
+                        console.log('按钮ID:', this.id);
+                        console.log('按钮文本:', this.textContent);
+                        console.log('this指向:', this);
+                        console.log('self指向:', self);
+                        console.log('当前连接类型:', document.getElementById('connectionType').value);
+                        console.log('========================================');
+                        
+                        // 禁用按钮防止重复点击
+                        this.disabled = true;
+                        this.textContent = '连接中...';
+                        
+                        try {
+                            await self.connect();
+                        } catch (error) {
+                            console.error('连接过程中出错:', error);
+                            self.addLog(`连接失败: ${error.message}`, 'error');
+                        } finally {
+                            // 恢复按钮状态
+                            this.disabled = false;
+                            this.textContent = '连接设备';
+                        }
+                    });
+                    console.log('连接设备按钮事件绑定成功');
+                    console.log('按钮元素:', magneticConnectBtn);
+                } else {
+                    console.error('未找到 magneticConnectBtn 元素');
+                }
+                
+                if (magneticDisconnectBtn) {
+                    const self = this;
+                    magneticDisconnectBtn.addEventListener('click', function(event) {
+                        console.log('断开连接按钮被点击');
+                        self.disconnect();
+                    });
+                    console.log('断开连接按钮事件绑定成功');
+                } else {
+                    console.error('未找到 magneticDisconnectBtn 元素');
+                }
+                
+                // 开始接收数据按钮事件
+                const startReceiveBtn = document.getElementById('startReceiveBtn');
+                const stopReceiveBtn = document.getElementById('stopReceiveBtn');
+                
+                if (startReceiveBtn) {
+                    const self = this;
+                    startReceiveBtn.addEventListener('click', function(event) {
+                        console.log('开始接收数据按钮被点击');
+                        self.startReceivingData();
+                    });
+                    console.log('开始接收数据按钮事件绑定成功');
+                }
+                
+                if (stopReceiveBtn) {
+                    const self = this;
+                    stopReceiveBtn.addEventListener('click', function(event) {
+                        console.log('停止接收数据按钮被点击');
+                        self.stopReceivingData();
+                    });
+                    console.log('停止接收数据按钮事件绑定成功');
+                }
+                
+                if (magneticClearBtn) {
+                    const self = this;
+                    magneticClearBtn.addEventListener('click', function(event) {
+                        console.log('清空数据按钮被点击');
+                        self.clearData();
+                    });
+                    console.log('清空数据按钮事件绑定成功');
+                } else {
+                    console.error('未找到 magneticClearBtn 元素');
+                }
+
+
+
+                console.log('事件绑定完成');
+            }
+            
+            handleConnectionTypeChange(type) {
+                console.log('连接方式切换为:', type);
+                
+                // 显示/隐藏相应的设置面板
+                const esp32NetworkSettings = document.getElementById('esp32NetworkSettings');
+                const networkSettings = document.getElementById('networkSettings');
+                if (networkSettings) {
+                    networkSettings.style.display = 'none';
+                }
+                
+                if (type === 'esp32-bluetooth') {
+                    if (esp32NetworkSettings) {
+                        esp32NetworkSettings.style.display = 'none';
+                    }
+                    this.addLog('已切换到ESP32蓝牙连接模式', 'info');
+                } else if (type === 'esp32-network') {
+                    if (esp32NetworkSettings) {
+                        esp32NetworkSettings.style.display = 'block';
+                    }
+                    this.addLog('已切换到ESP32网络连接模式', 'info');
+                } else if (type === 'network') {
+                    if (esp32NetworkSettings) {
+                        esp32NetworkSettings.style.display = 'none';
+                    }
+                    if (networkSettings) {
+                        networkSettings.style.display = 'block';
+                    }
+                    this.setDefaultCloudServerUrl();
+                    this.addLog('已切换到云端服务器连接模式', 'info');
+                }
+            }
+            
+            
+
+
+            async connect() {
+                console.log('=== connect() 方法被调用 ===');
+                
+                // 检查是否正在连接
+                if (this.isConnecting) {
+                    console.warn('正在连接中，忽略重复连接请求');
+                    this.addLog('⚠️ 正在连接中，请稍候', 'warning');
+                    return;
+                }
+                
+                // 设置连接锁
+                this.isConnecting = true;
+                
+                try {
+                    const connectionType = this.getDomElement('connectionType').value;
+                    console.log('连接类型:', connectionType);
+                    
+                    // 设置该连接类型的连接中状态
+                    if (this.connections[connectionType]) {
+                        this.connections[connectionType].connecting = true;
+                    }
+                    
+                    if (connectionType === 'esp32-bluetooth') {
+                        const deviceCount = await this.askBluetoothDeviceCount();
+                        if (deviceCount === null) {
+                            this.addLog('已取消蓝牙设备连接', 'info');
+                            return;
+                        }
+
+                        this.addLog(`准备连接 ${deviceCount} 个蓝牙设备`, 'info');
+                        let successCount = 0;
+                        let failCount = 0;
+
+                        for (let i = 0; i < deviceCount; i++) {
+                            this.addLog(`正在连接第 ${i + 1}/${deviceCount} 个蓝牙设备...`, 'info');
+                            try {
+                                await this.connectEsp32Bluetooth();
+                                successCount += 1;
+                            } catch (batchError) {
+                                failCount += 1;
+                                this.addLog(`第 ${i + 1} 个设备连接失败: ${batchError.message}`, 'warning');
+                            }
+                        }
+
+                        this.addLog(`蓝牙批量连接完成：成功 ${successCount} 个，失败 ${failCount} 个`, 'info');
+                this.updateSensorOptions();
+                this.updateSensorSelectButtons();
+                this.updateSensorSelectButtonLabel();
+                    } else if (connectionType === 'esp32-network') {
+                        console.log('准备连接ESP32网络...');
+                        await this.connectEsp32Network();
+                    } else if (connectionType === 'network') {
+                        console.log('准备连接云端服务器...');
+                        await this.connectWebSocket();
+                    } else {
+                        console.error('未知的连接类型:', connectionType);
+                        this.addLog(`❌ 未知的连接类型: ${connectionType}`, 'error');
+                    }
+                } finally {
+                    // 释放连接锁
+                    this.isConnecting = false;
+                    console.log('=== connect() 方法完成 ===');
+                }
+            }
+            
+            async askBluetoothDeviceCount() {
+                const modal = document.getElementById('bluetoothCountModal');
+                const input = document.getElementById('bluetoothCountInput');
+                const confirmBtn = document.getElementById('confirmBluetoothCountBtn');
+                const cancelBtn = document.getElementById('cancelBluetoothCountBtn');
+
+                if (!modal || !input || !confirmBtn || !cancelBtn) {
+                    this.addLog('❌ 蓝牙数量输入弹窗未初始化', 'error');
+                    return null;
+                }
+
+                input.value = '1';
+                modal.style.display = 'block';
+                input.focus();
+                input.select();
+
+                return await new Promise((resolve) => {
+                    let settled = false;
+
+                    const cleanup = () => {
+                        confirmBtn.removeEventListener('click', onConfirm);
+                        cancelBtn.removeEventListener('click', onCancel);
+                        modal.removeEventListener('click', onOverlayClick);
+                        input.removeEventListener('keydown', onKeyDown);
+                        modal.style.display = 'none';
+                    };
+
+                    const finish = (value) => {
+                        if (settled) return;
+                        settled = true;
+                        cleanup();
+                        resolve(value);
+                    };
+
+                    const onConfirm = () => {
+                        const value = parseInt(input.value, 10);
+                        if (!Number.isInteger(value) || value < 1 || value > 10) {
+                            this.addLog('❌ 设备数量无效，请输入 1-10 的整数', 'error');
+                            input.focus();
+                            input.select();
+                            return;
+                        }
+                        finish(value);
+                    };
+
+                    const onCancel = () => finish(null);
+                    const onOverlayClick = (event) => {
+                        if (event.target === modal) {
+                            finish(null);
+                        }
+                    };
+                    const onKeyDown = (event) => {
+                        if (event.key === 'Enter') {
+                            event.preventDefault();
+                            onConfirm();
+                        }
+                        if (event.key === 'Escape') {
+                            event.preventDefault();
+                            onCancel();
+                        }
+                    };
+
+                    confirmBtn.addEventListener('click', onConfirm);
+                    cancelBtn.addEventListener('click', onCancel);
+                    modal.addEventListener('click', onOverlayClick);
+                    input.addEventListener('keydown', onKeyDown);
+                });
+            }
+
+            
+            async connectWebSocket() {
+                try {
+                    if (this.socket && this.socket.connected) {
+                        this.addLog('✅ Socket.IO实时通道已连接', 'success');
+                        if (!this.connections.network) {
+                            this.connections.network = {};
+                        }
+                        this.connections.network.connected = true;
+                        this.connections.network.connecting = false;
+                        this.updateConnectionStatus();
+                        return;
+                    }
+
+                    this.addLog('正在尝试连接Socket.IO服务器...', 'info');
+                    
+                    this.setDefaultCloudServerUrl();
+                    const wsUrl = this.getDomElement('wsUrl').value;
+                    const reconnectInterval = parseInt(this.getDomElement('reconnectInterval').value) * 1000;
+                    
+                    // 验证服务器地址
+                    if (!wsUrl || wsUrl.trim() === '') {
+                        throw new Error('请输入有效的服务器地址');
+                    }
+                    
+                    // 确保URL格式正确
+                    if (!wsUrl.startsWith('http://') && !wsUrl.startsWith('https://')) {
+                        throw new Error('服务器地址必须以 http:// 或 https:// 开头');
+                    }
+                    
+                    this.addLog(`连接地址: ${wsUrl}`, 'info');
+                    this.addLog(`重连间隔: ${reconnectInterval/1000}秒`, 'info');
+                    
+                    // 检查Socket.IO是否可用
+                    if (typeof io === 'undefined') {
+                        throw new Error('Socket.IO客户端未加载，请刷新页面重试');
+                    }
+                    
+                    // 清理可能存在的旧连接
+                    if (this.socket) {
+                        try {
+                            this.socket.disconnect();
+                            this.socket = null;
+                        } catch (e) {
+                            console.log('清理旧连接时出错:', e);
+                        }
+                    }
+                    
+                    // 测试HTTP连接
+                    this.addLog('🔍 正在测试HTTP连接...', 'info');
+                    try {
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+                        
+                        this.addLog(`正在请求: ${wsUrl}/api/status`, 'info');
+                        const response = await fetch(`${wsUrl}/api/status`, {
+                            method: 'GET',
+                            mode: 'cors',
+                            cache: 'no-cache',
+                            signal: controller.signal
+                        });
+                        
+                        clearTimeout(timeoutId);
+                        
+                        this.addLog(`HTTP响应状态: ${response.status} ${response.statusText}`, 'info');
+                        
+                        if (response.ok) {
+                            const data = await response.json();
+                            this.addLog(`✅ HTTP连接成功！`, 'success');
+                            this.addLog(`📊 服务器状态: ${data.status}`, 'info');
+                        } else {
+                            throw new Error(`HTTP连接失败: ${response.status} ${response.statusText}`);
+                        }
+                    } catch (httpError) {
+                        if (httpError.name === 'AbortError') {
+                            throw new Error('HTTP连接超时，请检查网络连接');
+                        }
+                        throw new Error(`HTTP连接测试失败: ${httpError.message}`);
+                    }
+                    
+                    // 创建Socket.IO连接
+                    this.addLog('🔌 正在创建Socket.IO连接...', 'info');
+                    
+                    // 创建连接Promise，用于超时控制
+                    const connectionPromise = new Promise((resolve, reject) => {
+                        try {
+                            this.addLog(`正在创建Socket.IO实例: ${wsUrl}`, 'info');
+                            
+                            // 先创建Socket.IO实例，但不立即连接
+                            this.socket = io(wsUrl, {
+                                transports: ['websocket', 'polling'],
+                                timeout: 20000,
+                                reconnection: true,
+                                reconnectionAttempts: 10,
+                                reconnectionDelay: reconnectInterval,
+                                reconnectionDelayMax: 30000,
+                                autoConnect: false,  // 先不自动连接，等事件监听器设置好后再连接
+                                forceNew: true,
+                                upgrade: true,
+                                rememberUpgrade: true
+                            });
+                            
+                            // 设置超时
+                            const timeoutId = setTimeout(() => {
+                                this.addLog('Socket.IO连接超时，正在清理...', 'error');
+                                if (this.socket) {
+                                    try {
+                                        this.socket.disconnect();
+                                        this.socket = null;
+                                    } catch (e) {
+                                        console.log('清理超时连接时出错:', e);
+                                    }
+                                }
+                                reject(new Error('Socket.IO连接超时'));
+                            }, 30000);
+                            
+                            // 先设置所有事件监听器，然后再连接
+                            
+                            // 连接成功事件
+                            this.socket.on('connect', () => {
+                                clearTimeout(timeoutId);
+                                this.addLog('Socket.IO连接成功事件触发', 'info');
+                                resolve();
+                            });
+                            
+                            // 连接错误事件
+                            this.socket.on('connect_error', (error) => {
+                                clearTimeout(timeoutId);
+                                this.addLog(`Socket.IO连接错误: ${error.message || '未知错误'}`, 'error');
+                                reject(new Error(`连接错误: ${error.message || '未知错误'}`));
+                            });
+                            
+                            // 连接超时事件
+                            this.socket.on('connect_timeout', () => {
+                                clearTimeout(timeoutId);
+                                this.addLog('Socket.IO连接超时事件触发', 'error');
+                                reject(new Error('Socket.IO连接超时'));
+                            });
+                            
+                            // 错误事件
+                            this.socket.on('error', (error) => {
+                                this.addLog(`Socket.IO错误: ${error.message || '未知错误'}`, 'error');
+                            });
+                            
+                            // 断开连接事件
+                            this.socket.on('disconnect', (reason) => {
+                                this.addLog(`Socket.IO断开连接: ${reason}`, 'info');
+                                // 更新网络连接状态
+                                if (this.connections.network) {
+                                    this.connections.network.connected = false;
+                                    this.updateConnectionStatus();
+                                }
+                            });
+                            
+                            // 所有事件监听器设置完成后，手动连接
+                            this.addLog('正在手动连接Socket.IO...', 'info');
+                            this.socket.connect();
+                            
+                        } catch (socketError) {
+                            this.addLog(`创建Socket.IO实例时出错: ${socketError.message}`, 'error');
+                            reject(new Error(`创建Socket.IO实例失败: ${socketError.message}`));
+                        }
+                    });
+                    
+                    // 等待连接完成
+                    this.addLog('等待Socket.IO连接完成...', 'info');
+                    await connectionPromise;
+                    
+                    // 连接成功后的处理
+                    if (!this.connections.network) {
+                        this.connections.network = {};
+                    }
+                    this.connections.network.connected = true;
+                    this.connections.network.connecting = false;
+                    // 更新连接状态显示
+                    this.updateConnectionStatus();
+                    this.addLog('🎉 Socket.IO连接成功！', 'success');
+                    this.addLog(`连接ID: ${this.socket.id}`, 'info');
+                    this.addLog('💡 后端实时通道已就绪，请继续连接ESP32设备', 'info');
+
+                    // 更新下拉框选项，立即显示已连接的设备
+                    this.updateSensorOptions();
+
+                    // 不要禁用连接按钮，因为现在支持多连接
+                    // 只更新断开按钮状态
+                    const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                    if (disconnectBtn) {
+                        disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                    }
+
+                    // 后端通道就绪不代表ESP32已连接，主状态保持等待设备连接
+                    this.updateConnectionStatus();
+
+                    const serverStatusElement = document.getElementById('serverConnectionStatus');
+                    if (serverStatusElement) {
+                        serverStatusElement.style.background = '#d4edda';
+                        serverStatusElement.style.color = '#155724';
+                        serverStatusElement.style.borderColor = '#c3e6cb';
+                        serverStatusElement.textContent = '✅ 后端服务与实时通道已连接';
+                    }
+                    
+                    // 接收服务器状态
+                    this.socket.on('status', (data) => {
+                        this.addLog(`📡 服务器状态: ${data.message}`, 'info');
+                    });
+                    
+                    // 接收磁场数据
+                    this.socket.on('magnetic_data', (data) => {
+                        try {
+                            if (this.isReceivingData) {
+                                console.log('收到磁场数据:', data);
+                            }
+                            if (data.x !== undefined && data.y !== undefined && data.z !== undefined) {
+                                const sourceDeviceId = data.device_id || data.deviceId || data.device || 'socketio';
+                                const sourceDeviceName = data.device_name || data.deviceName || data.device || 'SocketIO';
+                                const sourceSensorId = data.sensor_id || data.sensorId || 'sensor1';
+                                this.addDataPoint(data.x, data.y, data.z, sourceDeviceName, sourceDeviceId, sourceSensorId);
+                            }
+                        } catch (error) {
+                            console.error('处理Socket.IO数据时出错:', error);
+                            this.addLog(`处理数据失败: ${error.message}`, 'warning');
+                        }
+                    });
+                    
+                } catch (error) {
+                    this.addLog(`❌ Socket.IO连接失败: ${error.message}`, 'error');
+                    this.updateConnectionStatus();
+                    console.error('Socket.IO连接错误:', error);
+                    
+                    // 清理失败的连接
+                    if (this.socket) {
+                        try {
+                            this.socket.disconnect();
+                            this.socket = null;
+                        } catch (e) {
+                            console.log('清理失败连接时出错:', e);
+                        }
+                    }
+                    
+                    // 网络连接失败，设置网络连接状态为未连接
+                    if (this.connections.network) {
+                        this.connections.network.connected = false;
+                        this.connections.network.connecting = false;
+                    }
+                    
+                    // 更新连接状态显示
+                    this.updateConnectionStatus();
+                    
+                    // 连接失败后，启用连接按钮，让用户手动重试
+                    document.getElementById('magneticConnectBtn').disabled = false;
+                    document.getElementById('magneticDisconnectBtn').disabled = true;
+                }
+            }
+            
+            async connectEsp32Bluetooth() {
+                try {
+                    console.log('=== 开始ESP32蓝牙连接流程 ===');
+                    this.updateStatus('准备连接...', 'connecting');
+                    this.addLog('正在尝试连接ESP32蓝牙...', 'info');
+                    
+                    // 直接使用BLE模式连接
+                    this.addLog('🔍 正在尝试BLE模式连接...', 'info');
+                    this.addLog('ℹ️ BLE模式使用低功耗蓝牙', 'info');
+                    
+                    try {
+                        await this.connectEsp32BluetoothBLE();
+                        console.log('=== ESP32蓝牙连接成功 ===');
+                        return;
+                    } catch (bleError) {
+                        console.log('BLE模式连接失败:', bleError);
+                        throw new Error(`蓝牙连接失败: ${bleError.message}`);
+                    }
+                    
+                } catch (error) {
+                    console.error('ESP32蓝牙连接错误:', error);
+                    this.addLog(`❌ ESP32蓝牙连接失败: ${error.message}`, 'error');
+                    this.addLog('💡 请检查以下事项:', 'info');
+                    this.addLog('1. ESP32设备是否已开启', 'info');
+                    this.addLog('2. ESP32是否已与电脑蓝牙配对', 'info');
+                    this.addLog('3. 浏览器是否支持Web Bluetooth API', 'info');
+                    this.addLog('4. 网页是否通过localhost或HTTPS访问', 'info');
+                    
+                    // 确保更新连接状态
+                    this.connections['esp32-bluetooth'].connected = false;
+                    this.connections['esp32-bluetooth'].connecting = false;
+                    
+                    this.updateConnectionStatus();
+                    
+                    document.getElementById('magneticConnectBtn').disabled = false;
+                    document.getElementById('magneticDisconnectBtn').disabled = true;
+                }
+            }
+            
+            async connectEsp32BluetoothBLE() {
+                try {
+                    this.addLog('🔍 开始蓝牙连接流程...', 'info');
+                    console.log('=== 蓝牙连接开始 ===');
+                    console.log('当前URL:', window.location.href);
+                    console.log('协议:', window.location.protocol);
+                    console.log('主机名:', window.location.hostname);
+                    
+                    // 检查是否在安全环境中运行
+                    if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                        this.addLog('⚠️ 警告: 非安全环境，蓝牙功能可能受限', 'warning');
+                        this.addLog('💡 建议使用 https:// 或 http://localhost 访问', 'info');
+                    }
+                    
+                    // 检查Web Bluetooth API是否可用
+                    console.log('检查navigator.bluetooth...');
+                    if (!('bluetooth' in navigator)) {
+                        console.error('Web Bluetooth API不可用');
+                        throw new Error('浏览器不支持Web Bluetooth API，请使用Chrome、Edge或Opera浏览器');
+                    }
+                    console.log('✅ navigator.bluetooth存在');
+                    
+                    // 检查navigator.bluetooth.requestDevice是否存在
+                    if (!navigator.bluetooth.requestDevice) {
+                        console.error('requestDevice方法不存在');
+                        throw new Error('浏览器不支持蓝牙设备选择功能，请更新浏览器');
+                    }
+                    console.log('✅ requestDevice方法存在');
+                    
+                    this.addLog('📱 正在调用蓝牙设备选择器...', 'info');
+                    console.log('准备调用navigator.bluetooth.requestDevice...');
+                    
+                    // 使用ESP32设备的服务UUID（从CiChang2_BLE.ino获取）
+                    const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+                    const CHARACTERISTIC_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+                    
+                    let device;
+                    let server;
+                    let dataService;
+                    let dataCharacteristic;
+                    let handler = null;
+                    try {
+                        this.addLog('📱 正在搜索蓝牙设备...', 'info');
+                        this.addLog('💡 请确保ESP32设备已开启并处于可发现模式', 'info');
+                        this.addLog('💡 电脑蓝牙已开启', 'info');
+                        this.addLog('💡 设备在电脑蓝牙范围内', 'info');
+                        this.addLog('💡 设备名称: cichang', 'info');
+                        this.addLog(`💡 服务UUID: ${SERVICE_UUID}`, 'info');
+                        this.addLog(`💡 特征UUID: ${CHARACTERISTIC_UUID}`, 'info');
+                        
+                        console.log('开始搜索蓝牙设备，服务UUID:', SERVICE_UUID);
+                        console.log('特征UUID:', CHARACTERISTIC_UUID);
+                        
+                        // 搜索所有蓝牙设备，确保能找到所有设备
+                        this.addLog('🔍 正在搜索周围所有蓝牙设备...', 'info');
+                        this.addLog('💡 请在弹出的设备列表中选择您的设备', 'info');
+                        this.addLog('💡 在弹出的对话框中应该能看到名为"cichang"的设备', 'info');
+                        console.log('调用requestDevice前...');
+                        
+                        // 使用acceptAllDevices: true确保能看到所有设备
+                        console.log('调用navigator.bluetooth.requestDevice({ acceptAllDevices: true })');
+                        device = await navigator.bluetooth.requestDevice({
+                            acceptAllDevices: true,
+                            optionalServices: [SERVICE_UUID]
+                        });
+                        
+                        console.log('requestDevice返回，device:', device);
+                        
+                        if (!device) {
+                            throw new Error('用户未选择设备');
+                        }
+                        
+                        this.addLog(`✅ 用户选择了设备: ${device.name || '未知'}`, 'success');
+                        this.addLog(`ℹ️ 设备ID: ${device.id}`, 'info');
+                        
+                        // 检查设备名称是否为cichang
+                        if (device.name && device.name.toLowerCase() === 'cichang') {
+                            this.addLog('✅ 找到目标设备: cichang', 'success');
+                        } else {
+                            this.addLog('⚠️ 所选设备名称不是cichang，继续尝试连接', 'warning');
+                        }
+                    } catch (deviceError) {
+                        console.error('设备选择过程出错:', deviceError);
+                        if (deviceError.name === 'NotFoundError') {
+                            this.addLog('❌ 未找到任何蓝牙设备', 'error');
+                            this.addLog('💡 请检查：', 'info');
+                            this.addLog('1. ESP32设备是否已开启', 'info');
+                            this.addLog('2. ESP32设备是否处于可发现模式', 'info');
+                            this.addLog('3. 电脑蓝牙是否已开启', 'info');
+                            this.addLog('4. 设备是否在电脑蓝牙范围内', 'info');
+                            throw new Error('未找到任何蓝牙设备，请确保设备已开启并处于可发现模式');
+                        } else if (deviceError.name === 'AbortError') {
+                            throw new Error('用户取消了设备选择');
+                        } else {
+                            this.addLog(`❌ 设备选择失败: ${deviceError.message}`, 'error');
+                            throw new Error(`设备选择失败: ${deviceError.message}`);
+                        }
+                    }
+                    
+                    // 连接到设备
+                    this.addLog('🔌 正在连接到ESP32蓝牙设备...', 'info');
+                    try {
+                        server = await device.gatt.connect();
+                        this.addLog('✅ GATT连接成功，正在获取服务...', 'success');
+                        
+                        // 监听设备断开事件
+                        device.addEventListener('gattserverdisconnected', () => {
+                            this.addLog('❌ 设备GATT连接已断开', 'error');
+                            this.connections['esp32-bluetooth'].connected = false;
+                            this.updateConnectionStatus();
+                        });
+                        
+                        // 首先尝试获取ESP32源代码中定义的服务
+                        let dataService = null;
+                        let dataCharacteristic = null;
+                        
+                        try {
+                            this.addLog(`🔍 尝试获取服务: ${SERVICE_UUID}`, 'info');
+                            dataService = await server.getPrimaryService(SERVICE_UUID);
+                            this.addLog(`✅ 成功获取服务: ${SERVICE_UUID}`, 'success');
+                        } catch (serviceError) {
+                            this.addLog(`⚠️ 获取服务失败: ${serviceError.message}`, 'warning');
+                            // 如果找不到预设服务，获取所有服务
+                            this.addLog('🔍 尝试获取所有可用服务...', 'info');
+                            const services = await server.getPrimaryServices();
+                            this.addLog(`✅ 找到 ${services.length} 个服务`, 'success');
+                            
+                            if (services.length > 0) {
+                                dataService = services[0];
+                                this.addLog(`✅ 使用第一个服务: ${dataService.uuid}`, 'success');
+                            } else {
+                                throw new Error('未找到任何可用的服务');
+                            }
+                        }
+                        
+                        // 尝试获取特征
+                        try {
+                            this.addLog(`🔍 尝试获取特征: ${CHARACTERISTIC_UUID}`, 'info');
+                            dataCharacteristic = await dataService.getCharacteristic(CHARACTERISTIC_UUID);
+                            this.addLog(`✅ 成功获取特征: ${CHARACTERISTIC_UUID}`, 'success');
+                        } catch (charError) {
+                            this.addLog(`⚠️ 获取特征失败: ${charError.message}`, 'warning');
+                            // 如果找不到预设特征，获取所有特征
+                            this.addLog('🔍 尝试获取所有可用特征...', 'info');
+                            const characteristics = await dataService.getCharacteristics();
+                            this.addLog(`✅ 找到 ${characteristics.length} 个特征`, 'success');
+                            
+                            // 优先选择支持notify或write的特征
+                            for (const char of characteristics) {
+                                if (char.properties.notify || char.properties.write) {
+                                    dataCharacteristic = char;
+                                    break;
+                                }
+                            }
+                            
+                            if (!dataCharacteristic && characteristics.length > 0) {
+                                dataCharacteristic = characteristics[0];
+                            }
+                            
+                            if (dataCharacteristic) {
+                                this.addLog(`✅ 使用特征: ${dataCharacteristic.uuid}`, 'success');
+                            } else {
+                                throw new Error('未找到任何可用的特征');
+                            }
+                        }
+                        
+                        // 检查特征属性
+                        const properties = [];
+                        if (dataCharacteristic.properties.read) properties.push('read');
+                        if (dataCharacteristic.properties.write) properties.push('write');
+                        if (dataCharacteristic.properties.notify) properties.push('notify');
+                        this.addLog(`ℹ️ 特征属性: [${properties.join(', ')}]`, 'info');
+                        
+                        // 订阅特征值变化（如果支持）
+                        if (dataCharacteristic.properties.notify) {
+                            try {
+                                await dataCharacteristic.startNotifications();
+                                handler = this.handleEsp32BluetoothData.bind(this);
+                                dataCharacteristic.addEventListener('characteristicvaluechanged', handler);
+                                this.addLog('✅ 已订阅特征值变化通知', 'success');
+                            } catch (notifyError) {
+                                this.addLog(`⚠️ 订阅通知失败: ${notifyError.message}`, 'warning');
+                                this.addLog('将使用其他方式获取数据', 'info');
+                            }
+                        } else {
+                            this.addLog('⚠️ 特征不支持notify，将使用其他方式获取数据', 'warning');
+                        }
+                    } catch (connectError) {
+                        this.addLog(`GATT连接失败: ${connectError.message}`, 'error');
+                        throw new Error(`连接设备失败: ${connectError.message}`);
+                    }
+                    
+                    // 存储设备信息
+                    const deviceInfo = {
+                        device: device,
+                        server: server,
+                        characteristic: dataCharacteristic,
+                        notificationHandler: handler,
+                        name: device.name || '未知设备',
+                        id: device.id
+                    };
+                    
+                    // 添加到设备列表
+                    this.bluetoothDevices.push(deviceInfo);
+                    this.bluetoothCharacteristics[device.id] = dataCharacteristic;
+                    this.connections['esp32-bluetooth'].devices.push(deviceInfo);
+
+
+
+                    // 更新设备选择按钮和下拉框选项
+                    this.updateDeviceSelectButtons();
+                    this.updateSensorOptions();
+
+                    // 更新连接状态
+                    this.connections['esp32-bluetooth'].connected = this.bluetoothDevices.length > 0;
+                    this.connections['esp32-bluetooth'].connecting = false;
+                    this.addLog('🎉 ESP32蓝牙BLE连接成功！', 'success');
+                    this.addLog(`💡 已连接 ${this.bluetoothDevices.length} 个蓝牙设备`, 'info');
+                    this.addLog('💡 点击"开始接收数据"按钮开始接收磁场数据', 'info');
+                    
+                    // 不要禁用连接按钮，因为现在支持多连接
+                    // 只更新断开按钮状态
+                    const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                    if (disconnectBtn) {
+                        disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                    }
+                    
+                    // 更新连接状态显示
+                    this.updateConnectionStatus();
+                    
+                } catch (bluetoothError) {
+                    let errorMessage = bluetoothError.message;
+                    
+                    // 提供更详细的错误信息
+                    if (bluetoothError.name === 'NotFoundError') {
+                        errorMessage = '未找到任何蓝牙设备，请确保设备已开启并处于可发现模式';
+                    } else if (bluetoothError.name === 'SecurityError') {
+                        errorMessage = '安全错误，请使用HTTPS或localhost访问';
+                    } else if (bluetoothError.name === 'NetworkError') {
+                        errorMessage = '网络错误，请检查蓝牙连接';
+                    } else if (bluetoothError.name === 'NotSupportedError') {
+                        errorMessage = '浏览器不支持Web Bluetooth API，请使用Chrome、Edge或Opera浏览器';
+                    }
+                    
+                    throw new Error(errorMessage);
+                }
+            }
+            
+            async connectEsp32Network() {
+                console.log('========================================');
+                console.log('connectEsp32Network() 方法被调用');
+                console.log('========================================');
+
+                const ipAddress = document.getElementById('esp32IpAddress').value.trim();
+                const port = document.getElementById('esp32Port').value.trim();
+                const protocol = document.getElementById('esp32Protocol').value;
+                const path = document.getElementById('esp32Path').value.trim() || '/data';
+
+                if (!ipAddress) {
+                    this.addLog('❌ 请输入ESP32的IP地址', 'error');
+                    throw new Error('请输入ESP32的IP地址');
+                }
+
+                const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+                if (!ipRegex.test(ipAddress)) {
+                    this.addLog('❌ IP地址格式不正确', 'error');
+                    throw new Error('IP地址格式不正确，请输入例如 192.168.1.100');
+                }
+
+                const deviceId = `${protocol}:${ipAddress}:${port}:${path}`;
+                const deviceName = `ESP32-Network-${ipAddress}:${port}`;
+
+                if (this.esp32NetworkDevices[deviceId]) {
+                    this.addLog(`⚠️ 网络设备 ${deviceName} 已连接`, 'warning');
+                    return;
+                }
+
+                this.addLog(`🌐 准备连接ESP32网络...`, 'info');
+                this.addLog(`📍 IP地址: ${ipAddress}:${port}`, 'info');
+                this.addLog(`🔌 协议: ${protocol.toUpperCase()}`, 'info');
+                this.addLog(`📂 路径: ${path}`, 'info');
+
+                try {
+                    if (protocol === 'websocket') {
+                        await this.connectEsp32NetworkWebSocket({ deviceId, deviceName, ipAddress, port, path });
+                    } else {
+                        await this.connectEsp32NetworkHttp({ deviceId, deviceName, ipAddress, port, path });
+                    }
+                } catch (error) {
+                    console.error('ESP32网络连接错误:', error);
+                    this.addLog(`❌ ESP32网络连接失败: ${error.message}`, 'error');
+                    delete this.esp32NetworkDevices[deviceId];
+                    this.connections['esp32-network'].connected = Object.keys(this.esp32NetworkDevices).length > 0;
+                    this.connections['esp32-network'].connecting = false;
+                    this.updateConnectionStatus();
+                    throw error;
+                }
+            }
+
+            async connectEsp32NetworkHttp({ deviceId, deviceName, ipAddress, port, path }) {
+                const url = `http://${ipAddress}:${port}${path}`;
+                this.addLog(`📡 正在发送HTTP请求: ${url}`, 'info');
+
+                try {
+                    const response = await fetch(url, {
+                        method: 'GET',
+                        mode: 'cors',
+                        headers: {
+                            'Accept': 'application/json, text/plain, */*'
+                        }
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP错误: ${response.status} ${response.statusText}`);
+                    }
+
+                    const data = await this.parseNetworkResponse(response);
+
+                    this.esp32NetworkDevices[deviceId] = {
+                        id: deviceId,
+                        name: deviceName,
+                        protocol: 'http',
+                        ipAddress,
+                        port,
+                        path,
+                        pollingTimer: null
+                    };
+
+                    this.addLog(`✅ HTTP连接测试成功`, 'success');
+                    this.addLog(`📊 收到的数据: ${JSON.stringify(data).substring(0, 100)}...`, 'info');
+
+                    this.connections['esp32-network'].connected = true;
+                    this.connections['esp32-network'].connecting = false;
+                    this.addLog(`🎉 ${deviceName} 连接成功！`, 'success');
+
+                    // 更新下拉框选项，立即显示已连接的设备
+                    this.updateSensorOptions();
+
+                    const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                    if (disconnectBtn) {
+                        disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                    }
+
+                    this.updateConnectionStatus();
+
+                    this.startEsp32NetworkPolling(deviceId);
+                } catch (error) {
+                    if (error.name === 'TypeError' && error.message.includes('fetch')) {
+                        throw new Error(`无法连接到 ${ipAddress}:${port}，请检查IP地址是否正确，以及ESP32服务器是否运行`);
+                    }
+                    throw error;
+                }
+            }
+
+            async connectEsp32NetworkWebSocket({ deviceId, deviceName, ipAddress, port, path }) {
+                const wsUrl = `ws://${ipAddress}:${port}${path}`;
+                this.addLog(`📡 正在连接WebSocket: ${wsUrl}`, 'info');
+
+                return new Promise((resolve, reject) => {
+                    try {
+                        const socket = new WebSocket(wsUrl);
+                        const networkDevice = {
+                            id: deviceId,
+                            name: deviceName,
+                            protocol: 'websocket',
+                            ipAddress,
+                            port,
+                            path,
+                            socket,
+                            pollingTimer: null
+                        };
+                        this.esp32NetworkDevices[deviceId] = networkDevice;
+
+                        socket.onopen = () => {
+                            this.addLog('✅ WebSocket连接已打开', 'success');
+                            this.connections['esp32-network'].connected = true;
+                            this.connections['esp32-network'].connecting = false;
+                            this.addLog(`🎉 ${deviceName} WebSocket连接成功！`, 'success');
+
+                            // 更新下拉框选项，立即显示已连接的设备
+                            this.updateSensorOptions();
+
+                            const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                            if (disconnectBtn) {
+                                disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                            }
+
+                            this.updateConnectionStatus();
+
+                            resolve();
+                        };
+
+                        socket.onmessage = (event) => {
+                            console.log('收到WebSocket数据:', event.data);
+                            try {
+                                let data = event.data;
+                                if (typeof data === 'string') {
+                                    try {
+                                        data = JSON.parse(data);
+                                    } catch {
+                                    }
+                                }
+                                this.processEsp32NetworkData(data, deviceName, deviceId);
+                            } catch (error) {
+                                console.error('处理WebSocket数据时出错:', error);
+                            }
+                        };
+
+                        socket.onerror = (error) => {
+                            console.error('WebSocket错误:', error);
+                            this.addLog(`❌ ${deviceName} WebSocket连接错误`, 'error');
+                            reject(new Error('WebSocket连接错误'));
+                        };
+
+                        socket.onclose = (event) => {
+                            console.log('WebSocket连接已关闭:', event);
+                            delete this.esp32NetworkDevices[deviceId];
+                            this.connections['esp32-network'].connected = Object.keys(this.esp32NetworkDevices).length > 0;
+                            this.updateConnectionStatus();
+                            if (!this.connections['esp32-network'].connected) {
+                                this.updateStatus('连接已断开', 'disconnected');
+                            }
+                        };
+
+                        setTimeout(() => {
+                            if (this.connections['esp32-network'].connecting && this.esp32NetworkDevices[deviceId]) {
+                                socket.close();
+                                reject(new Error('WebSocket连接超时'));
+                            }
+                        }, 10000);
+
+                    } catch (error) {
+                        reject(error);
+                    }
+                });
+            }
+
+            startEsp32NetworkPolling(deviceId) {
+                const networkDevice = this.esp32NetworkDevices[deviceId];
+                if (!networkDevice) {
+                    return;
+                }
+
+                if (networkDevice.pollingTimer) {
+                    clearInterval(networkDevice.pollingTimer);
+                }
+
+                const pollInterval = 200;
+                this.addLog(`📡 开始轮询数据 (间隔: ${pollInterval}ms)`, 'info');
+
+                networkDevice.pollingTimer = setInterval(async () => {
+                    if (!this.esp32NetworkDevices[deviceId]) {
+                        clearInterval(networkDevice.pollingTimer);
+                        return;
+                    }
+
+                    try {
+                        const url = `http://${networkDevice.ipAddress}:${networkDevice.port}${networkDevice.path}`;
+                        const response = await fetch(url, {
+                            method: 'GET',
+                            mode: 'cors'
+                        });
+
+                        if (response.ok) {
+                            const data = await this.parseNetworkResponse(response);
+                            this.processEsp32NetworkData(data, networkDevice.name, deviceId);
+                        }
+                    } catch (error) {
+                    }
+                }, pollInterval);
+            }
+
+            async parseNetworkResponse(response) {
+                const contentType = response.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {
+                    return await response.json();
+                }
+
+                const text = await response.text();
+                const trimmedText = text.trim();
+                if (!trimmedText) {
+                    return '';
+                }
+
+                try {
+                    return JSON.parse(trimmedText);
+                } catch {
+                    return trimmedText;
+                }
+            }
+
+            cleanCiChangPayload(text) {
+                return String(text || '')
+                    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                    .replace(/<[^>]*>/g, ' ')
+                    .replace(/&nbsp;/gi, ' ')
+                    .replace(/&amp;/gi, '&')
+                    .replace(/&lt;/gi, '<')
+                    .replace(/&gt;/gi, '>')
+                    .replace(/[，]/g, ',')
+                    .replace(/[；]/g, ';')
+                    .replace(/[：]/g, ':')
+                    .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+            }
+
+            parseCiChangSensorPackets(text) {
+                const trimmedLine = this.cleanCiChangPayload(text);
+                if (!trimmedLine || trimmedLine.toLowerCase().includes('heartbeat')) {
+                    return [];
+                }
+
+                const packets = [];
+                const numberPattern = '([-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?)';
+                const sensorRegex = new RegExp(`\\bS\\s*(\\d+)\\s*:\\s*${numberPattern}\\s*,\\s*${numberPattern}\\s*,\\s*${numberPattern}`, 'gi');
+                let match;
+
+                while ((match = sensorRegex.exec(trimmedLine)) !== null) {
+                    const sensorNumber = parseInt(match[1], 10);
+                    const sensorIndex = Number.isFinite(sensorNumber) && sensorNumber > 0 ? sensorNumber : packets.length + 1;
+                    const x = parseFloat(match[2]);
+                    const y = parseFloat(match[3]);
+                    const z = parseFloat(match[4]);
+
+                    if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
+                        packets.push({
+                            sensorId: `sensor${sensorIndex}`,
+                            name: `传感器${sensorIndex}`,
+                            x,
+                            y,
+                            z
+                        });
+                    }
+                }
+
+                return packets;
+            }
+
+            addParsedSensorPackets(packets, deviceName, deviceId) {
+                if (!Array.isArray(packets) || packets.length === 0) {
+                    return false;
+                }
+
+                let addedCount = 0;
+                packets.forEach(packet => {
+                    if (!packet) return;
+                    const x = parseFloat(packet.x);
+                    const y = parseFloat(packet.y);
+                    const z = parseFloat(packet.z);
+                    const sensorId = packet.sensorId || packet.id || 'sensor1';
+
+                    if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
+                        this.addDataPoint(x, y, z, deviceName, deviceId, sensorId);
+                        addedCount++;
+                    }
+                });
+
+                if (addedCount > 0) {
+                    console.log(`${deviceName} 解析到 ${addedCount} 路传感器数据`);
+                    return true;
+                }
+
+                return false;
+            }
+
+            getCompleteBleLines(deviceId, chunk) {
+                const key = deviceId || 'unknown';
+                const combined = `${this.bluetoothLineBuffers[key] || ''}${String(chunk || '')}`;
+                const lines = combined.split(/\r?\n/);
+                const completeLines = lines.slice(0, -1);
+                const trailing = lines[lines.length - 1] || '';
+
+                this.bluetoothLineBuffers[key] = trailing;
+
+                const bufferedPackets = this.parseCiChangSensorPackets(trailing);
+                const looksLikeCiChangPacket = /\bS\s*\d+\s*:/i.test(trailing);
+                if (completeLines.length === 0 && (!looksLikeCiChangPacket || bufferedPackets.length >= 2)) {
+                    this.bluetoothLineBuffers[key] = '';
+                    return [trailing];
+                }
+
+                if (this.bluetoothLineBuffers[key].length > 512) {
+                    const packets = this.parseCiChangSensorPackets(this.bluetoothLineBuffers[key]);
+                    const bufferedLine = this.bluetoothLineBuffers[key];
+                    this.bluetoothLineBuffers[key] = '';
+                    return packets.length > 0 ? [bufferedLine] : [];
+                }
+
+                return completeLines.filter(line => line.trim());
+            }
+
+            parseCiChangTextData(text) {
+                const trimmedLine = this.cleanCiChangPayload(text);
+                if (!trimmedLine) {
+                    return null;
+                }
+
+                if (trimmedLine.toLowerCase().includes('heartbeat')) {
+                    return null;
+                }
+
+                if (/\bS\s*\d+\s*:/i.test(trimmedLine)) {
+                    return null;
+                }
+
+                const xyzMatch = trimmedLine.match(/xyzmT:\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)/i);
+                if (xyzMatch) {
+                    return {
+                        x: parseFloat(xyzMatch[1]),
+                        y: parseFloat(xyzMatch[2]),
+                        z: parseFloat(xyzMatch[3])
+                    };
+                }
+
+                const axisMatches = {};
+                trimmedLine.replace(/([XYZ])\s*:\s*([-+]?\d*\.?\d+)/gi, (_, axis, value) => {
+                    axisMatches[axis.toLowerCase()] = parseFloat(value);
+                    return _;
+                });
+
+                if (axisMatches.x !== undefined && axisMatches.y !== undefined && axisMatches.z !== undefined) {
+                    return {
+                        x: axisMatches.x,
+                        y: axisMatches.y,
+                        z: axisMatches.z
+                    };
+                }
+
+                const values = trimmedLine
+                    .replace(/^\[.*?\]\s*/, '')
+                    .split(',')
+                    .map(value => {
+                        const match = String(value).match(/[-+]?\d*\.?\d+/);
+                        return match ? parseFloat(match[0]) : NaN;
+                    });
+
+                if (values.length >= 3 && values.slice(0, 3).every(value => !isNaN(value))) {
+                    return { x: values[0], y: values[1], z: values[2] };
+                }
+
+                return null;
+            }
+
+            processEsp32NetworkData(data, deviceName, deviceId) {
+                if (!this.isReceivingData) {
+                    return;
+                }
+
+                console.log(`处理${deviceName}网络数据:`, data);
+
+                const rawPayload = typeof data === 'string'
+                    ? data
+                    : (data && typeof data.raw === 'string' ? data.raw : null);
+                if (rawPayload) {
+                    const packets = this.parseCiChangSensorPackets(rawPayload);
+                    if (this.addParsedSensorPackets(packets, deviceName, deviceId)) {
+                        return;
+                    }
+                }
+
+                // 解析数据
+                let x, y, z;
+                let sensorId = 'sensor1';
+
+                if (typeof data === 'object' && data !== null) {
+                    // 尝试从对象中提取xyz
+                    sensorId = data.sensor_id || data.sensorId || sensorId;
+                    if (data.x !== undefined && data.y !== undefined && data.z !== undefined) {
+                        x = parseFloat(data.x);
+                        y = parseFloat(data.y);
+                        z = parseFloat(data.z);
+                    } else if (data.magnetic && data.magnetic.x !== undefined) {
+                        x = parseFloat(data.magnetic.x);
+                        y = parseFloat(data.magnetic.y);
+                        z = parseFloat(data.magnetic.z);
+                        sensorId = data.magnetic.sensor_id || data.magnetic.sensorId || sensorId;
+                    } else if (data.data && Array.isArray(data.data)) {
+                        // 假设格式为 [x, y, z]
+                        x = parseFloat(data.data[0]);
+                        y = parseFloat(data.data[1]);
+                        z = parseFloat(data.data[2]);
+                    } else if (typeof data.raw === 'string') {
+                        const parsed = this.parseCiChangTextData(data.raw);
+                        if (parsed) {
+                            x = parsed.x;
+                            y = parsed.y;
+                            z = parsed.z;
+                        }
+                    }
+                } else if (typeof data === 'string') {
+                    const parsed = this.parseCiChangTextData(data);
+                    if (parsed) {
+                        x = parsed.x;
+                        y = parsed.y;
+                        z = parsed.z;
+                    }
+                }
+
+                if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
+                    this.addDataPoint(x, y, z, deviceName, deviceId, sensorId);
+                } else {
+                    console.warn('无法解析网络数据:', data);
+                }
+            }
+
+            async disconnectEsp32Network(deviceId = null) {
+                console.log('断开ESP32网络连接...');
+
+                const targetIds = deviceId
+                    ? [deviceId]
+                    : Object.keys(this.esp32NetworkDevices);
+
+                for (const id of targetIds) {
+                    const networkDevice = this.esp32NetworkDevices[id];
+                    if (!networkDevice) {
+                        continue;
+                    }
+
+                    if (networkDevice.pollingTimer) {
+                        clearInterval(networkDevice.pollingTimer);
+                        networkDevice.pollingTimer = null;
+                    }
+
+                    if (networkDevice.socket) {
+                        if (networkDevice.socket.readyState === WebSocket.OPEN || networkDevice.socket.readyState === WebSocket.CONNECTING) {
+                            networkDevice.socket.close();
+                        }
+                        networkDevice.socket = null;
+                    }
+
+                    delete this.esp32NetworkDevices[id];
+                    Object.keys(this.deviceData || {}).forEach(channelId => {
+                        const data = this.deviceData[channelId];
+                        if (data && data.sourceDeviceId === id) {
+                            delete this.deviceData[channelId];
+                        }
+                    });
+                }
+
+                if (this.currentSelectedDevice && !this.deviceData[this.currentSelectedDevice]) {
+                    this.currentSelectedDevice = null;
+                    this.currentSelectedSensor = 'all';
+                    this.redrawChart();
+                }
+
+                this.connections['esp32-network'].connected = Object.keys(this.esp32NetworkDevices).length > 0;
+                this.connections['esp32-network'].connecting = false;
+                this.pruneDisconnectedDeviceData();
+                this.updateSensorOptions();
+                this.updateSensorSelectButtonLabel();
+                this.addLog('🔌 ESP32网络连接已断开', 'info');
+            }
+
+
+        
+
+        
+        processEsp32Data(data, deviceName = 'ESP32', deviceId = 'unknown') {
+                // 始终显示接收到的原始数据，便于调试
+                console.log(`[${new Date().toLocaleTimeString()}] 收到原始数据:`, data);
+
+                // 即使还未开始接收数据，也显示数据到达的日志
+                if (!this.isReceivingData) {
+                    console.log('尚未开始接收数据，跳过处理');
+                    // 可以在这里显示一个提示，让用户知道有数据到达
+                    // this.addLog(`📥 收到数据但未开始处理: ${data.substring(0, 50)}...`, 'warning');
+                    return;
+                }
+
+                console.log(`处理${deviceName}数据:`, data);
+
+                try {
+                    const trimmedLine = this.cleanCiChangPayload(data);
+                    if (!trimmedLine) {
+                        if (this.isReceivingData) {
+                            console.log('空数据，跳过');
+                        }
+                        return;
+                    }
+
+                    // 处理心跳消息
+                    if (trimmedLine.toLowerCase() === 'heartbeat' || trimmedLine.toLowerCase().includes('heartbeat')) {
+                        console.log('收到心跳消息，跳过处理');
+                        return;
+                    }
+
+                    if (this.isReceivingData) {
+                        this.addLog(`📥 ${deviceName}收到数据: ${trimmedLine.substring(0, 100)}...`, 'info');
+                    }
+
+                    const ciChangPackets = this.parseCiChangSensorPackets(trimmedLine);
+                    if (this.addParsedSensorPackets(ciChangPackets, deviceName, deviceId)) {
+                        return;
+                    }
+
+                    // 支持多种数据格式
+                    if (trimmedLine.startsWith('{')) {
+                        // JSON格式
+                        if (this.isReceivingData) {
+                            console.log('检测到JSON格式数据');
+                        }
+                        try {
+                            // 清理可能的非法字符
+                            let cleanedJson = trimmedLine
+                                .replace(/[\x00-\x1F\x7F-\x9F]/g, '')  // 移除控制字符
+                                .replace(/\r/g, '')  // 移除回车符
+                                .trim();
+
+                            console.log('清理后的JSON:', cleanedJson);
+
+                            // 检查JSON是否完整
+                            const openBraces = (cleanedJson.match(/\{/g) || []).length;
+                            const closeBraces = (cleanedJson.match(/\}/g) || []).length;
+
+                            if (openBraces !== closeBraces) {
+                                console.warn(`JSON括号不匹配: { 数量=${openBraces}, } 数量=${closeBraces}`);
+                                this.addLog(`${deviceName} JSON数据不完整，等待更多数据`, 'warning');
+                                return;
+                            }
+
+                            const parsedData = JSON.parse(cleanedJson);
+                            console.log('JSON解析成功:', parsedData);
+                            this.processJsonData(parsedData, deviceName, deviceId);
+                        } catch (jsonError) {
+                            console.error('JSON解析失败:', jsonError);
+                            console.error('原始数据:', trimmedLine);
+                            console.error('数据长度:', trimmedLine.length);
+                            console.error('数据字节:', Array.from(trimmedLine).map(c => c.charCodeAt(0)));
+                            this.addLog(`${deviceName} JSON解析失败: ${jsonError.message}`, 'warning');
+                            this.addLog(`原始数据: ${trimmedLine.substring(0, 100)}`, 'info');
+                        }
+                    } else if (trimmedLine.includes('xyzmT:')) {
+                        // ESP32复杂数据格式：包含空/正常/断裂状态和xyz值
+                        if (this.isReceivingData) {
+                            console.log('检测到ESP32复杂数据格式');
+                        }
+                        try {
+                            // 提取xyzmT后面的值
+                            const xyzMatch = trimmedLine.match(/xyzmT:([-\d.,]+)/);
+                            if (xyzMatch) {
+                                const values = xyzMatch[1].split(',').map(parseFloat);
+
+                                if (values.length === 3) {
+                                    // 单个传感器数据: x,y,z
+                                    const x = values[0];
+                                    const y = values[1];
+                                    const z = values[2];
+
+                                    if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
+                                        if (this.isReceivingData) {
+                                            console.log(`${deviceName} 解析成功: x=${x}, y=${y}, z=${z}`);
+                                        }
+                                        this.addDataPoint(x, y, z, deviceName, deviceId, 'sensor1');
+                                    }
+                                } else if (values.length === 12) {
+                                    // 三个传感器数据: s1x,s1y,s1z,s2x,s2y,s2z,s3x,s3y,s3z
+                                    const sensors = [
+                                        { x: values[0], y: values[1], z: values[2], name: '传感器1' },
+                                        { x: values[3], y: values[4], z: values[5], name: '传感器2' },
+                                        { x: values[6], y: values[7], z: values[8], name: '传感器3' }
+                                    ];
+
+                                    sensors.forEach((sensor, index) => {
+                                        if (!isNaN(sensor.x) && !isNaN(sensor.y) && !isNaN(sensor.z)) {
+                                            if (this.isReceivingData) {
+                                                console.log(`${deviceName} ${sensor.name} 解析成功: x=${sensor.x}, y=${sensor.y}, z=${sensor.z}`);
+                                            }
+                                            const sensorId = `sensor${index + 1}`;
+                                            this.addDataPoint(sensor.x, sensor.y, sensor.z, deviceName, deviceId, sensorId);
+                                        }
+                                    });
+                                }
+
+                                // 提取状态信息
+                                let status = '正常';
+                                if (trimmedLine.includes('空:')) {
+                                    status = '空';
+                                } else if (trimmedLine.includes('断裂:')) {
+                                    status = '断裂';
+                                }
+
+                                if (this.isReceivingData) {
+                                    this.addLog(`${deviceName} 📊 磁场状态: ${status}`, 'info');
+                                }
+                            } else {
+                                console.warn('无法匹配xyzmT格式');
+                                this.addLog(`${deviceName} 无法解析数据格式`, 'warning');
+                            }
+                        } catch (parseError) {
+                            console.error('复杂数据格式解析失败:', parseError);
+                            this.addLog(`${deviceName} 数据解析失败: ${parseError.message}`, 'warning');
+                        }
+                    } else if (trimmedLine.includes(',')) {
+                        // 逗号分隔格式，如 "1.23,4.56,7.89" 或 "X:-0.03mT,Y:0.031mT,Z:-0.038mT" 或 "[SENSOR] X:0.01mT,Y:-0.073mT,Z:0.013mT"
+                        if (this.isReceivingData) {
+                            console.log('检测到逗号分隔格式数据');
+                        }
+
+                        // 移除可能的前缀标签（如 [SENSOR]）
+                        let cleanedLine = trimmedLine.replace(/^\[.*?\]\s*/, '');
+                        console.log('清理后的数据:', cleanedLine);
+
+                        const values = cleanedLine.split(',');
+                        if (values.length >= 3) {
+                            // 尝试解析为x,y,z格式或X:value,Y:value,Z:value格式
+                            let x, y, z;
+
+                            // 检查是否为键值对格式（如 X:-0.03mT,Y:0.031mT,Z:-0.038mT）
+                            if (values[0].includes(':')) {
+                                // 键值对格式
+                                for (const value of values) {
+                                    const [key, val] = value.split(':');
+                                    if (key && val) {
+                                        const trimmedKey = key.trim().toLowerCase();
+                                        // 提取数字部分，去掉单位（如 mT）
+                                        const numStr = val.trim().replace(/[^-0-9.]/g, '');
+                                        const num = parseFloat(numStr);
+                                        if (!isNaN(num)) {
+                                            if (trimmedKey === 'x') x = num;
+                                            else if (trimmedKey === 'y') y = num;
+                                            else if (trimmedKey === 'z') z = num;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // 普通逗号分隔格式
+                                x = parseFloat(values[0]);
+                                y = parseFloat(values[1]);
+                                z = parseFloat(values[2]);
+                            }
+
+                            if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
+                                if (this.isReceivingData) {
+                                    console.log(`${deviceName} 解析成功: x=${x}, y=${y}, z=${z}`);
+                                }
+                                this.addDataPoint(x, y, z, deviceName, deviceId, 'sensor1');
+                            } else {
+                                console.warn('数据解析失败，包含非数字值');
+                                console.warn('x:', x, 'y:', y, 'z:', z);
+                                this.addLog(`${deviceName} 数据解析失败: ${trimmedLine}`, 'warning');
+                            }
+                        } else {
+                            console.warn('数据格式不正确，需要至少3个值');
+                            this.addLog(`${deviceName} 数据格式不正确: ${trimmedLine}`, 'warning');
+                        }
+                    } else if (trimmedLine.includes(':')) {
+                        // 键值对格式，如 "x:1.23 y:4.56 z:7.89"
+                        if (this.isReceivingData) {
+                            console.log('检测到键值对格式数据');
+                        }
+                        try {
+                            const keyValuePairs = trimmedLine.split(' ');
+                            const dataObj = {};
+                            for (const pair of keyValuePairs) {
+                                const [key, value] = pair.split(':');
+                                if (key && value) {
+                                    dataObj[key.trim()] = parseFloat(value.trim());
+                                }
+                            }
+                            if (dataObj.x !== undefined && dataObj.y !== undefined && dataObj.z !== undefined) {
+                                console.log(`解析成功: x=${dataObj.x}, y=${dataObj.y}, z=${dataObj.z}`);
+                                this.addDataPoint(dataObj.x, dataObj.y, dataObj.z, deviceName, deviceId, 'sensor1');
+                            } else {
+                                console.warn('键值对解析失败，缺少x/y/z值');
+                            }
+                        } catch (kvError) {
+                            console.error('键值对解析失败:', kvError);
+                            this.addLog(`键值对解析失败: ${kvError.message}`, 'warning');
+                        }
+                    } else {
+                        console.warn('未知数据格式:', trimmedLine);
+                        this.addLog(`未知数据格式: ${trimmedLine.substring(0, 50)}...`, 'warning');
+                    }
+                } catch (error) {
+                    console.error('处理ESP32数据时出错:', error);
+                    this.addLog(`处理ESP32数据失败: ${error.message}`, 'warning');
+                }
+            }
+
+            processJsonData(data, deviceName = 'ESP32', deviceId = 'unknown') {
+                console.log(`processJsonData 被调用，设备: ${deviceName}, 数据:`, data);
+
+                const sensorId = data.sensor_id || data.sensorId || 'sensor1';
+                let dataProcessed = false;
+
+                // 处理MLX90393传感器的数据格式
+                if (data.x !== undefined && data.y !== undefined && data.z !== undefined) {
+                    // 标准xyz格式
+                    console.log(`检测到标准xyz格式: x=${data.x}, y=${data.y}, z=${data.z}`);
+                    this.addDataPoint(data.x, data.y, data.z, deviceName, deviceId, sensorId);
+                    dataProcessed = true;
+                } else if (data.magnetic !== undefined) {
+                    // MLX90393常见格式: {"magnetic": {"x": 1.23, "y": 4.56, "z": 7.89}}
+                    const mag = data.magnetic;
+                    if (mag.x !== undefined && mag.y !== undefined && mag.z !== undefined) {
+                        console.log(`检测到magnetic格式: x=${mag.x}, y=${mag.y}, z=${mag.z}`);
+                        this.addDataPoint(mag.x, mag.y, mag.z, deviceName, deviceId, sensorId);
+                        dataProcessed = true;
+                    }
+                } else if (data.Bx !== undefined && data.By !== undefined && data.Bz !== undefined) {
+                    // 另一种MLX90393格式: {"Bx": 1.23, "By": 4.56, "Bz": 7.89}
+                    console.log(`检测到Bx/By/Bz格式: Bx=${data.Bx}, By=${data.By}, Bz=${data.Bz}`);
+                    this.addDataPoint(data.Bx, data.By, data.Bz, deviceName, deviceId, sensorId);
+                    dataProcessed = true;
+                }
+
+                if (!dataProcessed) {
+                    console.warn('JSON数据格式不匹配任何已知格式');
+                    console.warn('数据内容:', JSON.stringify(data));
+                    console.warn('可用的键:', Object.keys(data));
+                    this.addLog(`${deviceName} 未识别的JSON数据格式，请检查数据结构`, 'warning');
+                    this.addLog(`数据键: ${Object.keys(data).join(', ')}`, 'info');
+                }
+            }
+            
+            handleEsp32BluetoothData(event) {
+                try {
+                    // 只有当isReceivingData为true时，才处理和显示数据
+                    if (!this.isReceivingData) {
+                        return;
+                    }
+                    
+                    const value = event.target.value;
+                    // 处理蓝牙数据，具体格式需要根据ESP32的实现调整
+                    const data = new TextDecoder().decode(value);
+                    
+                    // 找到对应的设备
+                    let deviceName = '未知设备';
+                    let deviceId = 'unknown';
+                    for (const deviceInfo of this.bluetoothDevices) {
+                        if (deviceInfo.characteristic === event.target) {
+                            deviceName = deviceInfo.name;
+                            deviceId = deviceInfo.id;
+                            break;
+                        }
+                    }
+                    
+                    const lines = this.getCompleteBleLines(deviceId, data);
+                    lines.forEach(line => {
+                        this.processEsp32Data(line, deviceName, deviceId);
+                    });
+                } catch (error) {
+                    console.error('处理ESP32蓝牙数据时出错:', error);
+                    this.addLog(`处理ESP32蓝牙数据失败: ${error.message}`, 'warning');
+                }
+            }
+
+            async disconnect() {
+                console.log('开始断开连接流程...');
+
+                if (this.isDisconnecting) {
+                    console.warn('正在断开连接中，忽略重复断开请求');
+                    this.addLog('⚠️ 正在断开连接中，请稍候', 'warning');
+                    return;
+                }
+
+                if (!this.hasActiveConnection()) {
+                    console.warn('没有活动连接，忽略断开请求');
+                    this.addLog('⚠️ 没有活动连接', 'warning');
+                    this.updateConnectionStatus();
+                    return;
+                }
+
+                try {
+                    const connectedDevices = this.getConnectedDevices();
+                    if (connectedDevices.length <= 1) {
+                        this.isDisconnecting = true;
+                        this.addLog('正在断开连接...', 'info');
+                        if (connectedDevices.length === 1) {
+                            await this.disconnectDeviceById(connectedDevices[0].id);
+                        } else {
+                            await this.disconnectAll();
+                        }
+                        this.updateAfterDisconnect();
+                        this.addLog('✅ 连接已断开', 'success');
+                        return;
+                    }
+
+                    this.showDisconnectModal();
+                } catch (error) {
+                    console.error('断开连接失败:', error);
+                    this.addLog(`❌ 断开连接失败: ${error.message}`, 'error');
+                    this.updateAfterDisconnect();
+                } finally {
+                    this.isDisconnecting = false;
+                }
+            }
+
+            async disconnectWebSocket() {
+                console.log('开始断开Socket.IO连接...');
+                
+                if (this.socket) {
+                    try {
+                        // 断开Socket.IO连接
+                        this.socket.disconnect();
+                        console.log('Socket.IO连接已断开');
+                    } catch (error) {
+                        console.log('断开Socket.IO时出错:', error);
+                    }
+                    this.socket = null;
+                }
+            }
+            
+            async disconnectESP32() {
+                console.log('开始断开ESP32连接...');
+                
+                // 停止心跳
+                this.stopEsp32Heartbeat();
+                
+                // 停止重连定时器
+                if (this.esp32ReconnectTimer) {
+                    clearTimeout(this.esp32ReconnectTimer);
+                    this.esp32ReconnectTimer = null;
+                }
+                
+                // 断开所有ESP32 WebSocket连接
+                for (let i = this.esp32Sockets.length - 1; i >= 0; i--) {
+                    const socket = this.esp32Sockets[i];
+                    try {
+                        // 断开ESP32 WebSocket连接
+                        socket.close();
+                        console.log(`ESP32连接 ${i+1} 已断开`);
+                    } catch (error) {
+                        console.log('断开ESP32时出错:', error);
+                    }
+                }
+                
+                // 清空连接数组
+                this.esp32Sockets = [];
+            }
+            
+            async disconnectEsp32Bluetooth() {
+                console.log('=== 开始断开ESP32蓝牙连接 ===');
+                
+                try {
+                    // 断开所有蓝牙设备
+                    for (const deviceInfo of this.bluetoothDevices) {
+                        try {
+                            // 停止特征通知
+                            if (deviceInfo.characteristic) {
+                                try {
+                                    await deviceInfo.characteristic.stopNotifications();
+                                    if (deviceInfo.notificationHandler) {
+                                        deviceInfo.characteristic.removeEventListener('characteristicvaluechanged', deviceInfo.notificationHandler);
+                                    }
+                                    console.log(`已停止设备 ${deviceInfo.name} 的通知`);
+                                } catch (error) {
+                                    console.log('停止蓝牙通知时出错:', error);
+                                }
+                            }
+                            
+                            // 断开GATT连接
+                            if (deviceInfo.server) {
+                                try {
+                                    deviceInfo.server.disconnect();
+                                    console.log(`ESP32蓝牙设备 ${deviceInfo.name || '未知'} 已断开`);
+                                } catch (error) {
+                                    console.log('断开ESP32蓝牙时出错:', error);
+                                }
+                            }
+                        } catch (error) {
+                            console.log('断开蓝牙设备时出错:', error);
+                        }
+                    }
+                    
+                    // 清空设备列表和相关状态
+                    this.bluetoothDevices = [];
+                    this.bluetoothCharacteristics = {};
+                    this.connections['esp32-bluetooth'].devices = [];
+                    this.connections['esp32-bluetooth'].connected = false;
+                    this.connections['esp32-bluetooth'].connecting = false;
+                    
+                    // 重置旧的变量（保持兼容性）
+                    this.esp32BluetoothCharacteristic = null;
+                    this.esp32BluetoothServer = null;
+                    this.esp32BluetoothDevice = null;
+                    
+                    // 停止任何相关的定时器
+                    if (this.esp32BluetoothTimer) {
+                        clearInterval(this.esp32BluetoothTimer);
+                        this.esp32BluetoothTimer = null;
+                    }
+                    
+                    console.log('=== ESP32蓝牙连接断开完成 ===');
+                    this.addLog('✅ 蓝牙设备已断开', 'success');
+                    
+                    // 更新UI状态
+                    this.pruneDisconnectedDeviceData();
+                    this.updateSensorOptions();
+                    this.updateSensorSelectButtonLabel();
+                    this.updateConnectionStatus();
+                    this.updateStatus('已断开连接', 'disconnected');
+                    
+                } catch (error) {
+                    console.error('断开蓝牙连接过程中出错:', error);
+                    this.addLog(`❌ 断开蓝牙连接时出错: ${error.message}`, 'error');
+                    
+                    // 即使出错也要清理状态
+                    this.bluetoothDevices = [];
+                    this.bluetoothCharacteristics = {};
+                    this.connections['esp32-bluetooth'].devices = [];
+                    this.connections['esp32-bluetooth'].connected = false;
+                    this.connections['esp32-bluetooth'].connecting = false;
+                    
+                    this.esp32BluetoothCharacteristic = null;
+                    this.esp32BluetoothServer = null;
+                    this.esp32BluetoothDevice = null;
+                    
+                    // 更新UI状态
+                    this.pruneDisconnectedDeviceData();
+                    this.updateSensorOptions();
+                    this.updateSensorSelectButtonLabel();
+                    this.updateConnectionStatus();
+                    this.updateStatus('断开失败', 'disconnected');
+                }
+            }
+            
+
+            
+            // 断开单个蓝牙设备
+            async disconnectSingleDevice(deviceId) {
+                // 首先检查是否是蓝牙BLE设备
+                const bleDeviceIndex = this.bluetoothDevices.findIndex(device => device.id === deviceId);
+                
+                if (bleDeviceIndex !== -1) {
+                    // 处理蓝牙BLE设备
+                    const deviceInfo = this.bluetoothDevices[bleDeviceIndex];
+                    
+                    try {
+                        // 停止特征通知
+                        if (deviceInfo.characteristic) {
+                            try {
+                                await deviceInfo.characteristic.stopNotifications();
+                                if (deviceInfo.notificationHandler) {
+                                    deviceInfo.characteristic.removeEventListener('characteristicvaluechanged', deviceInfo.notificationHandler);
+                                }
+                            } catch (error) {
+                                console.log('停止蓝牙通知时出错:', error);
+                            }
+                        }
+                        
+                        // 断开GATT连接
+                        if (deviceInfo.server) {
+                            try {
+                                deviceInfo.server.disconnect();
+                                this.addLog(`✅ ${deviceInfo.name} 已断开连接`, 'success');
+                            } catch (error) {
+                                console.log('断开ESP32蓝牙时出错:', error);
+                            }
+                        }
+                        
+                        // 从设备列表中移除
+                        this.bluetoothDevices.splice(bleDeviceIndex, 1);
+                        delete this.bluetoothCharacteristics[deviceId];
+                        delete this.bluetoothLineBuffers[deviceId];
+                        Object.keys(this.deviceData || {}).forEach(channelId => {
+                            const data = this.deviceData[channelId];
+                            if (data && data.sourceDeviceId === deviceId) {
+                                delete this.deviceData[channelId];
+                            }
+                        });
+                        
+                    } catch (error) {
+                        this.addLog(`❌ 断开BLE设备时出错: ${error.message}`, 'error');
+                        console.error('断开BLE设备时出错:', error);
+                    }
+                } else {
+                    this.addLog('未找到指定的蓝牙设备', 'warning');
+                    return;
+                }
+                
+                // 更新连接状态
+                this.connections['esp32-bluetooth'].connected = this.bluetoothDevices.length > 0;
+                this.pruneDisconnectedDeviceData();
+                
+
+                
+                // 更新设备选择按钮
+                this.updateDeviceSelectButtons();
+                
+                // 如果断开的是当前选中的设备通道，自动选择另一个设备
+                if (this.currentSelectedDevice && !this.deviceData[this.currentSelectedDevice]) {
+                    if (this.bluetoothDevices.length > 0) {
+                        this.selectDevice(this.bluetoothDevices[0].id);
+                    } else if (this.connections['esp32-bluetooth'].devices.length > 0) {
+                        this.selectDevice(this.connections['esp32-bluetooth'].devices[0].id);
+                    } else {
+                        this.currentSelectedDevice = null;
+                        this.currentSelectedSensor = 'all';
+                        this.redrawChart();
+                    }
+                }
+                
+                // 更新连接状态显示
+                this.updateConnectionStatus();
+            }
+            
+            getSensorChannelKey(deviceId, sensorId = 'sensor1') {
+                return `${deviceId}__${sensorId}`;
+            }
+
+            normalizeSensorId(sensorId = 'sensor1') {
+                const rawId = String(sensorId || 'sensor1').trim();
+                const numberMatch = rawId.match(/\d+/);
+                if (numberMatch) {
+                    return `sensor${parseInt(numberMatch[0], 10)}`;
+                }
+                return rawId || 'sensor1';
+            }
+
+            getSensorLabel(sensorId = 'sensor1') {
+                const normalizedId = this.normalizeSensorId(sensorId);
+                const numberMatch = normalizedId.match(/\d+/);
+                return numberMatch ? `传感器${parseInt(numberMatch[0], 10)}` : normalizedId;
+            }
+
+            assignDefaultSensorDisplayMapping(channelId) {
+                if (!this.sensorDisplayMapping || !channelId) return;
+
+                const alreadyMapped = Object.values(this.sensorDisplayMapping).includes(channelId);
+                if (alreadyMapped) return;
+
+                for (let displayPos = 1; displayPos <= 3; displayPos++) {
+                    const key = `display${displayPos}`;
+                    const mappedId = this.sensorDisplayMapping[key];
+                    if (!mappedId || !this.deviceData[mappedId]) {
+                        this.sensorDisplayMapping[key] = channelId;
+                        try {
+                            localStorage.setItem('sensorDisplayMapping', JSON.stringify(this.sensorDisplayMapping));
+                        } catch (error) {
+                            console.warn('保存传感器显示映射失败:', error);
+                        }
+                        return;
+                    }
+                }
+            }
+
+            // 初始化设备数据存储
+            initDeviceData(channelId, deviceName, sourceDeviceId = null, sensorId = 'sensor1') {
+                this.deviceData[channelId] = {
+                    name: deviceName,
+                    sourceDeviceId: sourceDeviceId || channelId,
+                    sensorId,
+                    xData: [],
+                    yData: [],
+                    zData: [],
+                    timeLabels: [],
+                    lastDataTime: 0
+                };
+            }
+            
+            // 切换传感器选择下拉菜单
+            toggleSensorDropdown() {
+                const dropdown = document.getElementById('sensorDropdown');
+                if (dropdown) {
+                    // 动态更新传感器选项
+                    this.updateSensorOptions();
+                    dropdown.style.display = dropdown.style.display === 'block' ? 'none' : 'block';
+                }
+            }
+            
+            updateSensorSelectButtonLabel() {
+                const selectBtn = document.getElementById('sensorSelectBtn');
+                if (!selectBtn) return;
+
+                const arrow = '<span style="font-size: 10px;">▼</span>';
+                if (!this.currentSelectedDevice) {
+                    selectBtn.innerHTML = `选择传感器（全部） ${arrow}`;
+                    return;
+                }
+
+                const selected = this.deviceData[this.currentSelectedDevice];
+                const selectedName = selected ? selected.name : this.currentSelectedDevice;
+                selectBtn.innerHTML = `选择传感器（${escapeHtml(selectedName)}） ${arrow}`;
+            }
+
+            trimSeriesArrays(...arrays) {
+                const maxPoints = this.memoryPolicy.maxSeriesPoints;
+                arrays.forEach(array => {
+                    if (!Array.isArray(array)) return;
+                    const excess = array.length - maxPoints;
+                    if (excess > 0) {
+                        array.splice(0, excess);
+                    }
+                });
+
+                if (this.currentSelectedDevice && !this.deviceData[this.currentSelectedDevice]) {
+                    this.currentSelectedDevice = null;
+                    this.currentSelectedSensor = 'all';
+                }
+            }
+
+            trimDeviceData(deviceData) {
+                if (!deviceData) return;
+                this.trimSeriesArrays(
+                    deviceData.xData,
+                    deviceData.yData,
+                    deviceData.zData,
+                    deviceData.timeLabels
+                );
+            }
+
+            trimChartData(chart) {
+                if (!chart || !chart.data) return;
+                const maxPoints = this.memoryPolicy.maxChartPoints;
+                const labels = chart.data.labels || [];
+                const excess = labels.length - maxPoints;
+                if (excess > 0) {
+                    labels.splice(0, excess);
+                    (chart.data.datasets || []).forEach(dataset => {
+                        if (Array.isArray(dataset.data)) {
+                            dataset.data.splice(0, excess);
+                        }
+                    });
+                }
+            }
+
+            pruneDisconnectedDeviceData() {
+                const activeSourceIds = new Set();
+                this.bluetoothDevices.forEach(device => activeSourceIds.add(device.id));
+                Object.keys(this.esp32NetworkDevices || {}).forEach(id => activeSourceIds.add(id));
+                if (this.socket && this.socket.connected) activeSourceIds.add('socketio');
+                if (this.esp32Sockets.some(socket => socket && socket.readyState !== WebSocket.CLOSED)) activeSourceIds.add('esp32');
+
+                const now = Date.now();
+                Object.keys(this.deviceData || {}).forEach(channelId => {
+                    const data = this.deviceData[channelId];
+                    const sourceId = data && data.sourceDeviceId ? data.sourceDeviceId : channelId.split('__')[0];
+                    const staleFor = now - (data && data.lastDataTime ? data.lastDataTime : 0);
+                    if (!activeSourceIds.has(sourceId) && staleFor > this.memoryPolicy.maxDisconnectedDeviceAgeMs) {
+                        delete this.deviceData[channelId];
+                    }
+                });
+            }
+            // 选择传感器
+            selectSensor(sensorId) {
+                this.currentSelectedSensor = sensorId;
+                if (sensorId === 'all') {
+                    this.currentSelectedDevice = null;
+                }
+
+                // 关闭下拉菜单
+                const dropdown = document.getElementById('sensorDropdown');
+                if (dropdown) {
+                    dropdown.style.display = 'none';
+                }
+
+                // 更新传感器选择按钮样式
+                this.updateSensorSelectButtons();
+                this.updateSensorSelectButtonLabel();
+
+                // 重新绘制图表
+                this.redrawChart();
+            }
+            
+            // 选择设备
+            selectDevice(deviceId) {
+                if (deviceId && !this.deviceData[deviceId]) {
+                    const matchingChannelId = Object.keys(this.deviceData || {})
+                        .find(channelId => {
+                            const channel = this.deviceData[channelId];
+                            return channel && channel.sourceDeviceId === deviceId;
+                        });
+                    if (matchingChannelId) {
+                        deviceId = matchingChannelId;
+                    } else {
+                        this.currentSelectedDevice = null;
+                        this.currentSelectedSensor = 'all';
+                        this.updateSensorSelectButtons();
+                        this.updateSensorSelectButtonLabel();
+                        this.redrawChart();
+                        return;
+                    }
+                }
+
+                this.currentSelectedDevice = deviceId;
+                const selectedChannel = this.deviceData[deviceId];
+                if (selectedChannel && selectedChannel.sensorId) {
+                    this.currentSelectedSensor = selectedChannel.sensorId;
+                }
+
+                // 关闭传感器选择下拉菜单
+                const dropdown = document.getElementById('sensorDropdown');
+                if (dropdown) {
+                    dropdown.style.display = 'none';
+                }
+
+                // 更新传感器选择按钮样式
+                this.updateSensorSelectButtons();
+                this.updateSensorSelectButtonLabel();
+
+                // 让仪表盘和数值立即切换到当前选中设备
+                const selectedData = this.deviceData[deviceId];
+                if (selectedData && selectedData.xData && selectedData.xData.length > 0) {
+                    const lastIdx = selectedData.xData.length - 1;
+                    const x = selectedData.xData[lastIdx] || 0;
+                    const y = selectedData.yData[lastIdx] || 0;
+                    const z = selectedData.zData[lastIdx] || 0;
+                    this.updateDataDisplay(x, y, z, selectedData.name || deviceId);
+                    this.updateGauges(x, y, z, deviceId);
+                }
+
+                // 重新绘制图表
+                this.redrawChart();
+            }
+            
+            // 更新传感器选项
+            updateSensorOptions() {
+                const dropdown = document.getElementById('sensorDropdown');
+                if (!dropdown) return;
+
+                const allOption = document.createElement('div');
+                allOption.style.padding = '8px 12px';
+                allOption.style.cursor = 'pointer';
+                allOption.style.borderBottom = '1px solid #e2e8f0';
+                allOption.style.color = '#1e293b';
+                allOption.style.background = '#ffffff';
+                allOption.textContent = '全部传感器';
+                allOption.onclick = () => this.selectSensor('all');
+
+                dropdown.innerHTML = '';
+                dropdown.appendChild(allOption);
+
+                const channelIds = Object.keys(this.deviceData || {});
+                this.connectedSensors = channelIds.length;
+
+                channelIds.forEach((channelId, index) => {
+                    const channelInfo = this.deviceData[channelId] || {};
+                    const option = document.createElement('div');
+                    option.dataset.deviceId = channelId;
+                    option.dataset.sourceDeviceId = channelInfo.sourceDeviceId || '';
+                    option.dataset.sensorId = channelInfo.sensorId || `sensor${index + 1}`;
+                    option.onclick = () => this.selectDevice(channelId);
+                    option.style.padding = '8px 12px';
+                    option.style.cursor = 'pointer';
+                    option.style.borderBottom = '1px solid #f0f0f0';
+                    option.style.color = '#1e293b';
+                    option.style.background = '#ffffff';
+                    option.textContent = channelInfo.name || `传感器${index + 1}`;
+                    dropdown.appendChild(option);
+                });
+            }
+            
+            // 更新传感器选择按钮
+            updateSensorSelectButtons() {
+                const dropdown = document.getElementById('sensorDropdown');
+                if (!dropdown) return;
+
+                const options = dropdown.children;
+                for (let i = 0; i < options.length; i++) {
+                    const option = options[i];
+                    const optionDeviceId = option.dataset ? option.dataset.deviceId : null;
+                    const isAllOption = i === 0;
+                    const isSelectedAll = isAllOption && !this.currentSelectedDevice;
+                    const isSelectedDevice = !isAllOption && this.currentSelectedDevice && optionDeviceId === this.currentSelectedDevice;
+
+                    if (isSelectedAll || isSelectedDevice) {
+                        option.style.background = '#e3f2fd';
+                        option.style.fontWeight = 'bold';
+                    } else {
+                        option.style.background = 'white';
+                        option.style.fontWeight = 'normal';
+                    }
+                }
+            }
+            
+            // 更新设备选择按钮（当前未实现设备选择器，预留接口）
+            updateDeviceSelectButtons() {
+                // 设备选择功能尚未完全实现，预留接口供未来扩展
+                console.log('设备选择按钮更新（预留接口）');
+            }
+
+            getConnectedDevices() {
+                const connectedDevices = [];
+
+                if (this.bluetoothDevices.length > 0) {
+                    this.bluetoothDevices.forEach(device => {
+                        connectedDevices.push({
+                            id: device.id,
+                            name: device.name || `蓝牙设备 (${device.id})`,
+                            type: 'ESP32 蓝牙BLE'
+                        });
+                    });
+                }
+
+                Object.values(this.esp32NetworkDevices || {}).forEach(device => {
+                    connectedDevices.push({
+                        id: device.id,
+                        name: device.name || `网络设备 (${device.id})`,
+                        type: `ESP32 网络 (${device.protocol || 'WebSocket'})`
+                    });
+                });
+
+                if (this.esp32Sockets.some(socket => socket && socket.readyState !== WebSocket.CLOSED)) {
+                    connectedDevices.push({
+                        id: 'esp32',
+                        name: 'ESP32 WebSocket连接',
+                        type: 'WebSocket'
+                    });
+                }
+
+                if (this.socket && this.socket.connected) {
+                    connectedDevices.push({
+                        id: 'network',
+                        name: `网络连接 (${this.socket.id || '未知'})`,
+                        type: 'Socket.IO'
+                    });
+                }
+
+                this.connections['esp32-bluetooth'].connected = this.bluetoothDevices.length > 0;
+                this.connections['esp32-network'].connected = Object.keys(this.esp32NetworkDevices || {}).length > 0;
+                this.connections.esp32.connected = this.esp32Sockets.some(socket => socket && socket.readyState !== WebSocket.CLOSED);
+                this.connections.network.connected = !!(this.socket && this.socket.connected);
+
+                return connectedDevices;
+            }
+
+            async disconnectDeviceById(deviceId) {
+                if (this.bluetoothDevices.some(device => device.id === deviceId)) {
+                    await this.disconnectSingleDevice(deviceId);
+                } else if (this.esp32NetworkDevices[deviceId]) {
+                    await this.disconnectEsp32Network(deviceId);
+                } else if (deviceId === 'network') {
+                    await this.disconnectWebSocket();
+                    this.connections.network.connected = false;
+                } else if (deviceId === 'esp32') {
+                    await this.disconnectESP32();
+                    this.connections.esp32.connected = false;
+                }
+            }
+
+            updateAfterDisconnect() {
+                this.connections['esp32-bluetooth'].connected = this.bluetoothDevices.length > 0;
+                this.connections['esp32-network'].connected = Object.keys(this.esp32NetworkDevices || {}).length > 0;
+                this.connections.esp32.connected = this.esp32Sockets.some(socket => socket && socket.readyState !== WebSocket.CLOSED);
+                this.connections.network.connected = !!(this.socket && this.socket.connected);
+
+                if (!this.hasActiveConnection()) {
+                    this.currentSelectedDevice = null;
+                    this.isReceivingData = false;
+                }
+
+                this.updateSensorOptions();
+                this.updateSensorSelectButtons();
+                this.updateSensorSelectButtonLabel();
+                this.updateConnectionStatus();
+                this.updateStatus(this.hasEsp32DataConnection() ? '已连接 - 等待开始接收' : '等待连接', this.hasEsp32DataConnection() ? 'connected' : 'disconnected');
+
+                const connectBtn = this.getDomElement('magneticConnectBtn');
+                const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                if (connectBtn) {
+                    connectBtn.disabled = false;
+                    connectBtn.textContent = '📡 连接设备';
+                }
+                if (disconnectBtn) {
+                    disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                }
+            }
+            
+            // 显示断开连接模态框
+            showDisconnectModal() {
+                const modal = document.getElementById('disconnectModal');
+                const devicesList = document.getElementById('connectedDevicesList');
+                if (!modal || !devicesList) {
+                    this.addLog('⚠️ 断开连接弹窗未找到，改为断开全部连接', 'warning');
+                    this.disconnectAll();
+                    return;
+                }
+
+                // 清空设备列表
+                devicesList.innerHTML = '';
+
+                // 收集所有已连接的设备
+                const connectedDevices = this.getConnectedDevices();
+
+                // 生成设备列表
+                if (connectedDevices.length > 0) {
+                    connectedDevices.forEach(device => {
+                        const deviceItem = document.createElement('div');
+                        deviceItem.style.display = 'flex';
+                        deviceItem.style.alignItems = 'center';
+                        deviceItem.style.padding = '10px';
+                        deviceItem.style.borderBottom = '1px solid #eee';
+                        deviceItem.style.backgroundColor = '#f9f9f9';
+
+                        const checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.id = `device-${device.id}`;
+                        checkbox.value = device.id;
+                        checkbox.style.marginRight = '10px';
+                        checkbox.style.cursor = 'pointer';
+
+                        const label = document.createElement('label');
+                        label.htmlFor = `device-${device.id}`;
+                        label.style.flex = '1';
+                        label.style.cursor = 'pointer';
+                        label.style.display = 'flex';
+                        label.style.flexDirection = 'column';
+                        label.style.gap = '4px';
+
+                        const nameSpan = document.createElement('span');
+                        nameSpan.textContent = device.name;
+                        nameSpan.style.fontWeight = 'bold';
+                        nameSpan.style.color = '#333';
+
+                        const typeSpan = document.createElement('span');
+                        typeSpan.textContent = `类型: ${device.type}`;
+                        typeSpan.style.fontSize = '12px';
+                        typeSpan.style.color = '#666';
+
+                        label.appendChild(nameSpan);
+                        label.appendChild(typeSpan);
+
+                        deviceItem.appendChild(checkbox);
+                        deviceItem.appendChild(label);
+                        devicesList.appendChild(deviceItem);
+                    });
+                } else {
+                    const noDeviceMsg = document.createElement('p');
+                    noDeviceMsg.textContent = '暂无已连接设备';
+                    noDeviceMsg.style.color = '#999';
+                    noDeviceMsg.style.textAlign = 'center';
+                    noDeviceMsg.style.padding = '20px';
+                    devicesList.appendChild(noDeviceMsg);
+                }
+
+                // 显示模态框
+                modal.style.display = 'block';
+
+                // 添加事件监听器
+                document.getElementById('closeDisconnectModal').onclick = () => {
+                    modal.style.display = 'none';
+                };
+
+                document.getElementById('disconnectSelectedBtn').onclick = async () => {
+                    await this.disconnectSelected();
+                    modal.style.display = 'none';
+                };
+
+                document.getElementById('disconnectAllBtn').onclick = async () => {
+                    await this.disconnectAll();
+                    modal.style.display = 'none';
+                };
+
+                // 点击模态框外部关闭
+                window.onclick = (event) => {
+                    if (event.target === modal) {
+                        modal.style.display = 'none';
+                    }
+                };
+            }
+            
+            // 断开选中的设备
+            async disconnectSelected() {
+                const checkboxes = document.querySelectorAll('#connectedDevicesList input[type="checkbox"]:checked');
+                const selectedDevices = Array.from(checkboxes).map(cb => cb.value);
+
+                if (selectedDevices.length === 0) {
+                    alert('⚠️ 请至少选中一个设备后再断开连接');
+                    this.addLog('⚠️ 请至少选中一个设备后再断开连接', 'warning');
+                    return;
+                }
+
+                this.isDisconnecting = true;
+                this.addLog(`正在断开选中的 ${selectedDevices.length} 个设备...`, 'info');
+
+                try {
+                    for (const deviceId of selectedDevices) {
+                        await this.disconnectDeviceById(deviceId);
+                    }
+
+                    // 清理状态
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    
+                    // 清理事件监听器
+                    this.cleanupEventListeners();
+                    this.updateAfterDisconnect();
+                    this.addLog(`✅ 已成功断开 ${selectedDevices.length} 个设备`, 'success');
+                    
+                } catch (error) {
+                    console.error('断开选中设备时出错:', error);
+                    this.addLog(`断开设备时出错: ${error.message}`, 'error');
+                    this.forceReset();
+                } finally {
+                    this.isDisconnecting = false;
+                    
+                    // 恢复按钮状态
+                    const connectBtn = this.getDomElement('magneticConnectBtn');
+                    const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                    if (connectBtn) {
+                        connectBtn.disabled = false;
+                    }
+                    if (disconnectBtn) {
+                        disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                    }
+                }
+            }
+            
+            // 断开所有连接
+            async disconnectAll() {
+                if (this.debugMode) console.log('开始断开所有连接...');
+                
+                // 设置断开锁
+                this.isDisconnecting = true;
+                
+                this.addLog('正在断开所有连接...', 'info');
+                
+                try {
+                    // 停止重连定时器
+                    if (this.reconnectTimer) {
+                        clearTimeout(this.reconnectTimer);
+                        this.reconnectTimer = null;
+                    }
+                    
+                    // 断开所有活动的连接
+                    if (this.connections.network.connected) {
+                        await this.disconnectWebSocket();
+                        this.connections.network.connected = false;
+                    }
+                    if (this.connections.esp32.connected) {
+                        await this.disconnectESP32();
+                        this.connections.esp32.connected = false;
+                    }
+                    if (this.connections['esp32-bluetooth'].connected) {
+                        await this.disconnectEsp32Bluetooth();
+                        this.connections['esp32-bluetooth'].connected = false;
+                    }
+                    if (this.connections['esp32-network'].connected) {
+                        await this.disconnectEsp32Network();
+                        this.connections['esp32-network'].connected = false;
+                    }
+                    
+                    // 等待读取循环自然结束
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    
+                    // 清理事件监听器
+                    this.cleanupEventListeners();
+                    
+                    // 完全重置状态
+                    this.resetAllStates();
+                    
+                    // 更新连接状态显示
+                    this.updateConnectionStatus();
+                    this.addLog('✅ 所有连接已成功断开', 'success');
+                    
+                } catch (error) {
+                    console.error('断开连接过程中出错:', error);
+                    this.addLog(`断开连接时出错: ${error.message}`, 'error');
+                    this.forceReset();
+                } finally {
+                    // 释放断开锁
+                    this.isDisconnecting = false;
+                    
+                    // 恢复按钮状态
+                    const connectBtn = this.getDomElement('magneticConnectBtn');
+                    const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                    if (connectBtn) {
+                        connectBtn.disabled = false;
+                    }
+                    if (disconnectBtn) {
+                        disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                    }
+                }
+            }
+            
+            // 重新绘制图表
+            redrawChart() {
+                if (!this.magneticDataChart) return;
+                
+                // 清空图表数据
+                this.magneticDataChart.data.labels = [];
+                this.magneticDataChart.data.datasets.forEach(dataset => {
+                    dataset.data = [];
+                });
+
+                const selectedData = this.currentSelectedDevice
+                    ? this.deviceData[this.currentSelectedDevice]
+                    : null;
+                const chartData = selectedData && selectedData.xData
+                    ? selectedData
+                    : (!this.currentSelectedDevice ? null : selectedData);
+
+                if (chartData && Array.isArray(chartData.xData)) {
+                    this.magneticDataChart.data.labels = chartData.timeLabels.slice();
+                    this.magneticDataChart.data.datasets[0].data = chartData.xData.slice();
+                    this.magneticDataChart.data.datasets[1].data = chartData.yData.slice();
+                    this.magneticDataChart.data.datasets[2].data = chartData.zData.slice();
+                    this.trimChartData(this.magneticDataChart);
+                }
+
+                // 更新图表标题，显示当前传感器
+                let title = `实时磁场数据可视化`;
+                if (this.currentSelectedDevice) {
+                    const selected = this.deviceData[this.currentSelectedDevice];
+                    title += ` (${selected ? selected.name : this.currentSelectedDevice})`;
+                } else if (this.currentSelectedSensor !== 'all') {
+                    title += ` (${this.getSensorLabel(this.currentSelectedSensor)})`;
+                }
+                this.magneticDataChart.options.plugins.title.text = title;
+                
+                this.magneticDataChart.update();
+            }
+            
+            // 检测连接的传感器数量
+            detectSensorCount() {
+                // 这里可以添加传感器数量检测逻辑
+                // 暂时默认设置为3个传感器
+                this.connectedSensors = 3;
+            }
+            
+            startEsp32Heartbeat() {
+                // 停止之前的心跳
+                this.stopEsp32Heartbeat();
+                
+                // 启动心跳定时器
+                this.esp32HeartbeatTimer = setInterval(() => {
+                    // 为每个ESP32连接发送心跳包
+                    this.esp32Sockets.forEach((socket, index) => {
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            try {
+                                // 发送心跳包
+                                socket.send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() }));
+                            } catch (error) {
+                                console.error(`发送ESP32 ${index+1} 心跳失败:`, error);
+                            }
+                        }
+                    });
+                }, this.esp32HeartbeatInterval);
+            }
+            
+            stopEsp32Heartbeat() {
+                if (this.esp32HeartbeatTimer) {
+                    clearInterval(this.esp32HeartbeatTimer);
+                    this.esp32HeartbeatTimer = null;
+                }
+            }
+            
+            attemptEsp32Reconnect() {
+                // 检查是否达到最大重连次数
+                if (this.esp32ReconnectAttempts >= this.maxReconnectAttempts) {
+                    this.addLog(`❌ ESP32重连失败，已达到最大重连次数(${this.maxReconnectAttempts})`, 'error');
+                    this.addLog('💡 请手动重新连接ESP32', 'info');
+                    return;
+                }
+                
+                // 增加重连计数
+                this.esp32ReconnectAttempts++;
+                
+                // 计算重连延迟（指数退避）
+                const delay = Math.min(1000 * Math.pow(2, this.esp32ReconnectAttempts - 1), 30000);
+                
+                this.addLog(`🔄 ${delay/1000}秒后尝试第${this.esp32ReconnectAttempts}次重连ESP32...`, 'info');
+                
+                // 设置重连定时器
+                this.esp32ReconnectTimer = setTimeout(() => {
+                    this.addLog('🔌 正在尝试重连ESP32...', 'info');
+                    
+                    // 获取ESP32地址和端口
+                    const esp32Ip = this.getDomElement('esp32IpAddress')?.value || '192.168.1.100';
+                    const esp32Port = this.getDomElement('esp32Port')?.value || '80';
+                    const esp32Url = `http://${esp32Ip}:${esp32Port}`;
+                    
+                    // 检测当前页面协议
+                    const isHttpsPage = window.location.protocol === 'https:';
+                    
+                    // 如果页面是HTTPS，尝试使用HTTPS连接ESP32
+                    let targetUrl = esp32Url;
+                    if (isHttpsPage) {
+                        targetUrl = targetUrl.replace('http://', 'https://');
+                    }
+                    
+                    // 创建WebSocket连接
+                    const wsProtocol = isHttpsPage ? 'wss' : 'ws';
+                    const wsUrl = targetUrl.replace('http://', `${wsProtocol}://`).replace('https://', `${wsProtocol}://`);
+                    
+                    // 如果是HTTPS页面且ESP32是本地IP，警告用户
+                    if (isHttpsPage && (wsUrl.includes('192.168.') || wsUrl.includes('10.') || wsUrl.includes('172.'))) {
+                        this.addLog('⚠️ HTTPS页面无法连接本地WebSocket (ws://)', 'warning');
+                        this.addLog('💡 请使用HTTP访问页面，或配置ESP32使用WSS', 'info');
+                    }
+                    
+                    // 创建新的WebSocket连接
+                    const esp32Socket = new WebSocket(wsUrl);
+                    
+                    // 添加到连接数组
+                    this.esp32Sockets.push(esp32Socket);
+                    const socketIndex = this.esp32Sockets.length - 1;
+                    
+                    // 事件处理器
+                    esp32Socket.onopen = () => {
+                        this.connections.esp32.connected = true;
+                        this.connections.esp32.connecting = false;
+                        this.esp32ReconnectAttempts = 0; // 重置重连计数
+                        this.addLog(`🎉 ESP32 ${socketIndex+1} 连接成功！`, 'success');
+                        
+                        // 启动心跳检测
+                        this.startEsp32Heartbeat();
+                        
+                        // 更新连接状态
+                        this.updateConnectionStatus();
+                        this.updateStatus('已连接 - 等待开始接收', 'connected');
+                    };
+                    
+                    esp32Socket.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (this.isReceivingData) {
+                                console.log(`收到ESP32 ${socketIndex+1} 数据:`, data);
+                            }
+                            this.processJsonData(data);
+                        } catch (error) {
+                            console.error(`处理ESP32 ${socketIndex+1} 数据时出错:`, error);
+                            this.addLog(`处理ESP32 ${socketIndex+1} 数据失败: ${error.message}`, 'warning');
+                        }
+                    };
+                    
+                    esp32Socket.onerror = (error) => {
+                        console.error(`ESP32 ${socketIndex+1} 连接错误:`, error);
+                        this.addLog(`❌ ESP32 ${socketIndex+1} 连接失败: ${error.message || '未知错误'}`, 'error');
+                        // 不停止心跳，因为其他连接可能还在工作
+                        // 从连接数组中移除
+                        this.esp32Sockets.splice(socketIndex, 1);
+                        // 更新连接状态
+                        if (this.esp32Sockets.length === 0) {
+                            this.connections.esp32.connected = false;
+                            this.stopEsp32Heartbeat();
+                        }
+                        this.updateConnectionStatus();
+                    };
+                    
+                    esp32Socket.onclose = (event) => {
+                        // 从连接数组中移除
+                        this.esp32Sockets.splice(socketIndex, 1);
+                        
+                        // 更新连接状态
+                        if (this.esp32Sockets.length === 0) {
+                            this.connections.esp32.connected = false;
+                            this.stopEsp32Heartbeat();
+                        }
+                        
+                        if (event.wasClean) {
+                            this.addLog(`✅ ESP32 ${socketIndex+1} 连接已正常关闭`, 'success');
+                        } else {
+                            this.addLog(`⚠️ ESP32 ${socketIndex+1} 连接断开: ${event.code} ${event.reason}`, 'warning');
+                        }
+                        
+                        this.updateConnectionStatus();
+                    };
+                    
+                }, delay);
+            }
+            
+            resetAllStates() {
+                console.log('正在重置所有状态...');
+                
+                // 重置所有连接状态
+                Object.keys(this.connections).forEach(type => {
+                    this.connections[type].connected = false;
+                    this.connections[type].connecting = false;
+                });
+                
+                // 重置连接锁
+                this.isConnecting = false;
+                this.isDisconnecting = false;
+                
+                // 清空缓冲区
+                this.dataBuffer = '';
+                
+                // 重置设备引用
+                this.bluetoothDevices = [];
+                this.bluetoothCharacteristics = {};
+                this.bluetoothLineBuffers = {};
+                this.esp32NetworkDevices = {};
+                this.esp32Sockets = [];
+                this.deviceData = {};
+                this.currentSelectedDevice = null;
+                this.currentSelectedSensor = 'all';
+                
+                // 重置按钮状态
+                const connectBtn = this.getDomElement('magneticConnectBtn');
+                const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                
+                if (connectBtn) {
+                    connectBtn.disabled = false;
+                    connectBtn.textContent = '📡 连接设备';
+                }
+                if (disconnectBtn) {
+                    disconnectBtn.disabled = true;
+                }
+                
+
+                
+                // 停止连接状态检查
+                this.stopConnectionCheck();
+                this.stopEsp32Heartbeat();
+                
+                console.log('状态重置完成');
+            }
+            
+            // 启动连接状态检查
+            startConnectionCheck() {
+                // 停止之前的检查
+                this.stopConnectionCheck();
+                
+                // 每5秒检查一次连接状态
+                this.connectionCheckInterval = setInterval(() => {
+                    this.checkConnectionStatus();
+                }, 5000);
+            }
+            
+            // 停止连接状态检查
+            stopConnectionCheck() {
+                if (this.connectionCheckInterval) {
+                    clearInterval(this.connectionCheckInterval);
+                    this.connectionCheckInterval = null;
+                }
+            }
+            
+            // 检查连接状态
+            checkConnectionStatus() {
+                // 检查网络连接
+                if (this.connections.network && this.connections.network.connected) {
+                    // 检查WebSocket连接是否仍然活跃
+                    if (this.socket && (this.socket.readyState === WebSocket.CLOSED || this.socket.readyState === WebSocket.CLOSING)) {
+                        this.connections.network.connected = false;
+                        this.updateConnectionStatus();
+                        this.addLog('❌ 网络连接已断开', 'error');
+                    }
+                }
+                
+                // 检查ESP32蓝牙连接
+                if (this.connections['esp32-bluetooth'].connected) {
+                    // 检查蓝牙设备是否仍然连接
+                    if (this.bluetoothDevices.length === 0 && this.connections['esp32-bluetooth'].devices.length === 0) {
+                        this.connections['esp32-bluetooth'].connected = false;
+                        this.updateConnectionStatus();
+                        this.addLog('❌ ESP32蓝牙设备已断开连接', 'error');
+                    }
+                }
+            }
+            
+            // 清理事件监听器
+            cleanupEventListeners() {
+                console.log('正在清理事件监听器...');
+                console.log('事件监听器清理完成');
+            }
+            
+            forceReset() {
+                console.log('正在强制重置所有状态...');
+                
+                // 强制清空所有连接相关的变量
+                Object.keys(this.connections).forEach(type => {
+                    this.connections[type].connected = false;
+                    this.connections[type].connecting = false;
+                });
+                this.dataBuffer = '';
+                this.bluetoothDevices = [];
+                this.bluetoothCharacteristics = {};
+                this.bluetoothLineBuffers = {};
+                this.esp32NetworkDevices = {};
+                this.esp32Sockets = [];
+                this.deviceData = {};
+                this.currentSelectedDevice = null;
+                this.currentSelectedSensor = 'all';
+                
+                // 重置UI状态
+                const connectBtn = document.getElementById('magneticConnectBtn');
+                const disconnectBtn = document.getElementById('magneticDisconnectBtn');
+                
+                if (connectBtn) {
+                    connectBtn.disabled = false;
+                    connectBtn.textContent = '📡 连接设备';
+                }
+                if (disconnectBtn) {
+                    disconnectBtn.disabled = true;
+                }
+                
+                this.updateStatus('连接已重置，可以重新连接', 'disconnected');
+                this.addLog('⚠️ 已强制重置连接状态', 'warning');
+                this.stopConnectionCheck();
+                this.stopEsp32Heartbeat();
+                console.log('强制重置完成');
+            }
+
+            addDataPoint(x, y, z, deviceName = 'ESP32', deviceId = 'unknown', sensorId = 'sensor1') {
+                console.log('添加数据点:', { x, y, z, deviceName, deviceId, sensorId, isReceivingData: this.isReceivingData });
+
+                // 检查是否正在接收数据
+                if (!this.isReceivingData) {
+                    console.log('未接收数据，跳过添加数据点');
+                    return;
+                }
+
+                const now = Date.now();
+                const timeLabel = new Date().toLocaleTimeString();
+
+                // 验证输入数据
+                if (isNaN(x) || isNaN(y) || isNaN(z)) {
+                    console.warn('收到无效数据:', { x, y, z });
+                    return;
+                }
+
+                const normalizedSensorId = this.normalizeSensorId(sensorId);
+                const channelId = this.getSensorChannelKey(deviceId, normalizedSensorId);
+                const sensorLabel = this.getSensorLabel(normalizedSensorId);
+                const channelName = `${deviceName}(${sensorLabel})`;
+
+                // 初始化设备数据存储
+                if (!this.deviceData[channelId]) {
+                    this.initDeviceData(channelId, channelName, deviceId, normalizedSensorId);
+                    this.assignDefaultSensorDisplayMapping(channelId);
+                    this.updateSensorOptions();
+                    this.updateSensorSelectButtonLabel();
+                    if (!this.currentSelectedDevice) {
+                        this.redrawChart();
+                    }
+                }
+
+                // 更新设备数据
+                const deviceData = this.deviceData[channelId];
+                deviceData.xData.push(x);
+                deviceData.yData.push(y);
+                deviceData.zData.push(z);
+                deviceData.timeLabels.push(timeLabel);
+                deviceData.lastDataTime = now;
+                this.trimDeviceData(deviceData);
+
+                // 更新当前值
+                this.currentValues = { x, y, z };
+
+                // 实时更新传感器数字显示
+                this.updateDataDisplay(x, y, z, channelName);
+
+                // 实时更新标注界面的传感器数据
+                if (typeof updateAnnotationSensorData === 'function') {
+                    updateAnnotationSensorData();
+                }
+
+                // 更新新的磁场数据图表和仪表盘
+                this.updateMagneticDataChart(x, y, z, channelName, channelId, normalizedSensorId);
+                this.updateGauges(x, y, z, channelId);
+
+
+                if (now - this.lastDataTime < this.dataInterval) {
+
+                    return;
+                }
+
+                this.lastDataTime = now;
+                const timeDiff = 0.2; // 固定200ms间隔
+
+                // 限制数据点数量（使用单次检查）
+                this.trimSeriesArrays(this.timeLabels, this.xData, this.yData, this.zData);
+
+                // 批量更新可视化
+
+            }
+            
+
+            
+            updateGradientChartRealtime(x, y, z) {
+                if (!this.gradientChart || this.timeLabels.length === 0) return;
+                
+                try {
+                    const lastIdx = this.timeLabels.length - 1;
+                    const prevX = this.xData[lastIdx];
+                    const prevY = this.yData[lastIdx];
+                    const prevZ = this.zData[lastIdx];
+                    
+                    // 快速计算梯度
+                    const xGradient = x - prevX;
+                    const yGradient = y - prevY;
+                    const zGradient = z - prevZ;
+                    
+                    // 简化的旋度和散度计算
+                    const divergence = xGradient + yGradient + zGradient;
+                    const curl = Math.sqrt(xGradient*xGradient + yGradient*yGradient + zGradient*zGradient) * 0.5;
+                    
+                    // 批量更新数据
+                    Object.assign(this.xData, { [lastIdx]: x });
+                    Object.assign(this.yData, { [lastIdx]: y });
+                    Object.assign(this.zData, { [lastIdx]: z });
+                    Object.assign(this.xGradientData, { [lastIdx]: xGradient });
+                    Object.assign(this.yGradientData, { [lastIdx]: yGradient });
+                    Object.assign(this.zGradientData, { [lastIdx]: zGradient });
+                    Object.assign(this.curlData, { [lastIdx]: curl });
+                    Object.assign(this.divergenceData, { [lastIdx]: divergence });
+                    
+                    // 使用 requestAnimationFrame 批量更新图表
+                    if (!this.chartUpdateScheduled) {
+                        this.chartUpdateScheduled = true;
+                        requestAnimationFrame(() => {
+                            this.gradientChart.update('none');
+                            this.chartUpdateScheduled = false;
+                        });
+                    }
+                } catch (error) {
+                    console.error('实时更新梯度图表时出错:', error);
+                }
+            }
+            
+
+            
+            updateDataDisplay(x, y, z, deviceName = 'ESP32') {
+                // 实时更新，移除防抖延迟以确保数据立即显示
+                const elements = [
+                    { id: 'xValue', value: x },
+                    { id: 'yValue', value: y },
+                    { id: 'zValue', value: z }
+                ];
+                
+                elements.forEach(({ id, value }) => {
+                    const element = this.getDomElement(id);
+                    if (element) {
+                        // 确保元素没有红色样式
+                        element.style.color = '';
+                        element.style.background = '';
+                        element.textContent = `${value.toFixed(3)} mT`;
+                    }
+                });
+                
+                // 更新设备名称显示
+                const deviceElement = this.getDomElement('deviceName');
+                if (deviceElement) {
+                    // 确保元素没有红色样式
+                    deviceElement.style.color = '';
+                    deviceElement.style.background = '';
+                    deviceElement.textContent = deviceName;
+                }
+            }
+
+
+            // 获取所有传感器数据
+            getAllSensorData() {
+                const sensorData = [];
+                const activeSensorIds = typeof getMappedActiveSensorIds === 'function'
+                    ? getMappedActiveSensorIds()
+                    : [];
+
+                activeSensorIds.slice(0, 3).forEach(deviceId => {
+                    const sensor = this.deviceData[deviceId];
+                    const x = sensor.xData[sensor.xData.length - 1] || 0;
+                    const y = sensor.yData[sensor.yData.length - 1] || 0;
+                    const z = sensor.zData[sensor.zData.length - 1] || 0;
+                    sensorData.push(x, y, z);
+                });
+
+                if (sensorData.length === 0 && this.currentValues) {
+                    const { x, y, z } = this.currentValues;
+                    sensorData.push(x, y, z);
+                }
+
+                if (sensorData.length === 0 && this.xData && this.xData.length > 0) {
+                    const x = this.xData[this.xData.length - 1] || 0;
+                    const y = this.yData[this.yData.length - 1] || 0;
+                    const z = this.zData[this.zData.length - 1] || 0;
+                    sensorData.push(x, y, z);
+                }
+                
+                // 确保返回9个值（3个传感器×3个轴）
+                while (sensorData.length < 9) {
+                    sensorData.push(0);
+                }
+                
+                const result = sensorData.slice(0, 9);
+                result.actualCount = Math.max(1, Math.min(3, activeSensorIds.length || 1));
+                return result;
+            }
+            
+
+
+            startReceivingData() {
+                console.log('开始接收数据，当前连接状态:', this.connections);
+                
+                // 检查是否有实际可接收数据的连接
+                let hasDataConnection = false;
+                if (this.connections['esp32-bluetooth'] && this.connections['esp32-bluetooth'].connected) {
+                    hasDataConnection = true;
+                    console.log('检测到蓝牙连接');
+                }
+                if (this.connections['esp32-network'] && this.connections['esp32-network'].connected) {
+                    hasDataConnection = true;
+                    console.log('检测到ESP32网络连接');
+                }
+                if (this.connections.esp32 && this.connections.esp32.connected) {
+                    hasDataConnection = true;
+                    console.log('检测到ESP32 WebSocket连接');
+                }
+                
+                console.log('是否有可接收数据的连接:', hasDataConnection);
+                
+                if (!hasDataConnection) {
+                    this.addLog('⚠️ 请先连接ESP32蓝牙或ESP32网络设备', 'warning');
+                    // 闪烁按钮以提供视觉反馈
+                    const startReceiveBtn = document.getElementById('startReceiveBtn');
+                    if (startReceiveBtn) {
+                        startReceiveBtn.style.background = '#dc2626';
+                        setTimeout(() => {
+                            startReceiveBtn.style.background = '#16a34a';
+                        }, 500);
+                    }
+                    return;
+                }
+                
+                this.isReceivingData = true;
+                console.log('isReceivingData已设置为true');
+                this.startConnectionCheck();
+                
+                // 更新连接状态显示
+                this.updateConnectionStatus();
+                
+                // 更新按钮状态
+                const startReceiveBtn = document.getElementById('startReceiveBtn');
+                const stopReceiveBtn = document.getElementById('stopReceiveBtn');
+                
+                if (startReceiveBtn) {
+                    startReceiveBtn.style.display = 'none';
+                }
+                if (stopReceiveBtn) {
+                    stopReceiveBtn.style.display = 'block';
+                }
+                
+                this.addLog('✅ 开始接收磁场数据', 'success');
+            }
+            
+            stopReceivingData() {
+                this.isReceivingData = false;
+                
+                // 更新连接状态显示
+                this.updateConnectionStatus();
+                
+                // 更新按钮状态
+                const startReceiveBtn = document.getElementById('startReceiveBtn');
+                const stopReceiveBtn = document.getElementById('stopReceiveBtn');
+                
+                if (startReceiveBtn) {
+                    startReceiveBtn.style.display = 'block';
+                }
+                if (stopReceiveBtn) {
+                    stopReceiveBtn.style.display = 'none';
+                }
+                
+                this.addLog('⏸️ 已停止接收磁场数据', 'info');
+            }
+            
+            setDefaultCloudServerUrl(showMessage = false) {
+                const currentOrigin = window.location.origin || `${window.location.protocol}//${window.location.host}`;
+                const wsUrlElement = document.getElementById('wsUrl');
+                const cloudServerHostElement = document.getElementById('cloudServerHost');
+                const scanStatusElement = document.getElementById('scanStatus');
+
+                if (wsUrlElement && (!wsUrlElement.value || showMessage)) {
+                    wsUrlElement.value = currentOrigin;
+                }
+                if (cloudServerHostElement && (!cloudServerHostElement.value || showMessage)) {
+                    cloudServerHostElement.value = currentOrigin;
+                }
+                if (scanStatusElement && showMessage) {
+                    scanStatusElement.textContent = `已使用当前云端地址：${currentOrigin}`;
+                    scanStatusElement.style.color = '#155724';
+                    scanStatusElement.style.fontWeight = 'bold';
+                }
+                if (showMessage) {
+                    this.addLog(`✅ 已使用当前云端服务地址: ${currentOrigin}`, 'success');
+                }
+
+                return currentOrigin;
+            }
+
+            hasActiveConnection() {
+                return (
+                    !!(this.socket && this.socket.connected) ||
+                    this.bluetoothDevices.length > 0 ||
+                    Object.keys(this.esp32NetworkDevices || {}).length > 0 ||
+                    this.esp32Sockets.some(socket => socket && socket.readyState !== WebSocket.CLOSED) ||
+                    (this.connections.network && this.connections.network.connected) ||
+                    (this.connections['esp32-bluetooth'] && this.connections['esp32-bluetooth'].connected) ||
+                    (this.connections['esp32-network'] && this.connections['esp32-network'].connected) ||
+                    (this.connections.esp32 && this.connections.esp32.connected)
+                );
+            }
+
+            hasEsp32DataConnection() {
+                return (
+                    this.bluetoothDevices.length > 0 ||
+                    Object.keys(this.esp32NetworkDevices || {}).length > 0 ||
+                    this.esp32Sockets.some(socket => socket && socket.readyState !== WebSocket.CLOSED) ||
+                    (this.connections['esp32-bluetooth'] && this.connections['esp32-bluetooth'].connected) ||
+                    (this.connections['esp32-network'] && this.connections['esp32-network'].connected) ||
+                    (this.connections.esp32 && this.connections.esp32.connected)
+                );
+            }
+
+            clearData() {
+                console.log('开始清空数据...');
+                
+                // 批量清空数组（使用length=0更高效）
+                this.timeLabels.length = 0;
+                this.xData.length = 0;
+                this.yData.length = 0;
+                this.zData.length = 0;
+                Object.values(this.deviceData || {}).forEach(device => {
+                    if (!device) return;
+                    device.xData.length = 0;
+                    device.yData.length = 0;
+                    device.zData.length = 0;
+                    device.timeLabels.length = 0;
+                    device.lastDataTime = 0;
+                });
+                
+                console.log('数据数组已清空');
+                
+                // 重置状态
+                this.lastDataTime = 0;
+                this.lastLogTime = 0;
+
+                this.currentValues = { x: 0, y: 0, z: 0 };
+                this.previousData = { x: 0, y: 0, z: 0 };
+                
+                // 清空控制台日志显示
+                const logContainer = this.getDomElement('magneticLogContainer');
+                if (logContainer) {
+                    logContainer.innerHTML = '';
+                    console.log('控制台日志已清空');
+                }
+                
+                console.log('状态已重置');
+                
+                // 更新UI（使用缓存的DOM元素）
+                const xEl = this.getDomElement('xValue');
+                const yEl = this.getDomElement('yValue');
+                const zEl = this.getDomElement('zValue');
+                if (xEl) xEl.textContent = '-- mT';
+                if (yEl) yEl.textContent = '-- mT';
+                if (zEl) zEl.textContent = '-- mT';
+                
+                console.log('UI显示已更新');
+                
+                if (this.magneticDataChart) {
+                    this.magneticDataChart.data.labels = [];
+                    this.magneticDataChart.data.datasets.forEach(dataset => {
+                        dataset.data = [];
+                    });
+                    this.magneticDataChart.update('none');
+                }
+
+                // 更新图表
+                if (this.gradientChart) {
+                    this.gradientChart.update('none');
+                    console.log('图表已更新');
+                }
+                
+                this.addLog('✅ 数据已清空', 'info');
+                console.log('数据清空完成');
+            }
+
+            cacheDomElements() {
+                const elements = [
+                    'magneticConnectBtn',
+                    'magneticDisconnectBtn',
+                    'magneticClearBtn',
+                    'magneticStatus',
+                    'connectionType',
+                    'xValue',
+                    'yValue',
+                    'zValue',
+                    'magneticLogContainer',
+                    'reconnectInterval'
+                ];
+                
+                elements.forEach(id => {
+                    this.domElements[id] = document.getElementById(id);
+                });
+            }
+            
+            getDomElement(id) {
+                if (!this.domElements[id]) {
+                    this.domElements[id] = document.getElementById(id);
+                }
+                return this.domElements[id];
+            }
+            
+            updateStatus(message, type) {
+                const statusElement = this.getDomElement('magneticStatus');
+                if (statusElement) {
+                    statusElement.textContent = message;
+                    statusElement.className = `magnetic-status ${type}`;
+                }
+            }
+            
+            // 更新连接状态显示 - 支持多连接
+            updateConnectionStatus() {
+                const activeConnections = [];
+                
+                // 检查ESP32蓝牙BLE连接
+                if (this.connections['esp32-bluetooth'] && this.connections['esp32-bluetooth'].connected) {
+                    activeConnections.push('ESP32蓝牙');
+                }
+                // 检查ESP32网络连接
+                if (this.connections['esp32-network'] && this.connections['esp32-network'].connected) {
+                    activeConnections.push('ESP32网络');
+                }
+                if (this.connections.esp32 && this.connections.esp32.connected) {
+                    activeConnections.push('ESP32 WebSocket');
+                }
+                
+                const statusElement = this.getDomElement('magneticStatus');
+                if (statusElement) {
+                    if (activeConnections.length > 0) {
+                        if (this.isReceivingData) {
+                            statusElement.textContent = `✅ 接收数据中: ${activeConnections.join(', ')}`;
+                        } else {
+                            statusElement.textContent = `✅ 已连接 - 等待开始接收: ${activeConnections.join(', ')}`;
+                        }
+                        statusElement.className = 'magnetic-status connected';
+                    } else {
+                        statusElement.textContent = '等待连接';
+                        statusElement.className = 'magnetic-status disconnected';
+                    }
+                }
+
+                const disconnectBtn = this.getDomElement('magneticDisconnectBtn');
+                if (disconnectBtn) {
+                    disconnectBtn.disabled = !this.hasEsp32DataConnection();
+                }
+                
+                // 更新开始接收数据按钮状态
+                const startReceiveBtn = document.getElementById('startReceiveBtn');
+                const stopReceiveBtn = document.getElementById('stopReceiveBtn');
+                
+                if (activeConnections.length > 0) {
+                    // 有连接时，根据接收状态显示按钮
+                    if (startReceiveBtn && stopReceiveBtn) {
+                        if (this.isReceivingData) {
+                            startReceiveBtn.style.display = 'none';
+                            stopReceiveBtn.style.display = 'block';
+                        } else {
+                            startReceiveBtn.style.display = 'block';
+                            startReceiveBtn.disabled = false;
+                            stopReceiveBtn.style.display = 'none';
+                        }
+                    }
+                } else {
+                    // 无连接时，禁用按钮
+                    if (startReceiveBtn) {
+                        startReceiveBtn.disabled = true;
+                        startReceiveBtn.style.display = 'block';
+                    }
+                    if (stopReceiveBtn) {
+                        stopReceiveBtn.style.display = 'none';
+                    }
+                    // 重置接收状态
+                    this.isReceivingData = false;
+                }
+            }
+
+            addLog(message, type = 'info') {
+                // 调试模式下才输出console.log
+                if (this.debugMode) {
+                    console.log(`addLog 被调用: ${message} (类型: ${type})`);
+                }
+                
+                const logContainer = this.getDomElement('magneticLogContainer');
+                if (!logContainer) {
+                    console.error('未找到 magneticLogContainer 元素');
+                    return;
+                }
+                
+                // 限制日志频率（避免高频数据日志刷屏）
+                const now = Date.now();
+                if (type === 'data' && this.lastLogTime && now - this.lastLogTime < 1000) {
+                    return; // 数据日志每秒最多一条
+                }
+                this.lastLogTime = now;
+                
+                const timestamp = new Date().toLocaleTimeString();
+                
+                const logEntry = document.createElement('div');
+                logEntry.className = 'log-entry';
+                
+                // 使用类静态属性避免重复创建
+                const typeSymbol = {
+                    'info': 'ℹ️',
+                    'success': '✅',
+                    'warning': '⚠️',
+                    'error': '❌',
+                    'data': '📊'
+                };
+                
+                logEntry.innerHTML = `
+                    <span class="log-timestamp">[${timestamp}]</span> 
+                    ${typeSymbol[type] || 'ℹ️'} ${escapeHtml(message)}
+                `;
+                
+                logContainer.appendChild(logEntry);
+                logContainer.scrollTop = logContainer.scrollHeight;
+                
+                // 限制日志条目数量，避免长时间运行时DOM持续增长
+                const maxLogs = this.memoryPolicy.maxLogEntries;
+                const excess = logContainer.children.length - maxLogs;
+                if (excess > 0) {
+                    for (let i = 0; i < excess; i++) {
+                        logContainer.removeChild(logContainer.firstChild);
+                    }
+                }
+            }
+        }
+
+        // 全局磁场监控实例
+        let magneticMonitor = null;
+        
+        // 页面加载完成后的初始化 - 优化加载速度：使用ES Modules
+        document.addEventListener('DOMContentLoaded', function(event) {
+            console.log('智觉探伤集成监控系统界面加载完成');
+            
+            // 先加载Socket.IO和Chart.js（传统方式）
+            loadBasicLibraries();
+        });
+        
+        function loadScriptWithFallback(name, urls, globalName) {
+            if (globalName && window[globalName]) {
+                return Promise.resolve(window[globalName]);
+            }
+
+            let index = 0;
+            return new Promise((resolve, reject) => {
+                const tryNext = () => {
+                    if (index >= urls.length) {
+                        reject(new Error(`${name} load failed`));
+                        return;
+                    }
+
+                    const url = urls[index++];
+                    const script = document.createElement('script');
+                    script.src = url;
+                    script.async = true;
+                    script.crossOrigin = 'anonymous';
+                    script.onload = function() {
+                        console.log(`${name} loaded from ${url}`);
+                        resolve(globalName ? window[globalName] : true);
+                    };
+                    script.onerror = function() {
+                        console.warn(`${name} failed from ${url}, trying next source`);
+                        script.remove();
+                        tryNext();
+                    };
+                    document.head.appendChild(script);
+                };
+
+                tryNext();
+            });
+        }
+
+        async function loadBasicLibraries() {
+            const socketSources = [
+                'https://cdn.bootcdn.net/ajax/libs/socket.io/4.7.5/socket.io.min.js',
+                'https://cdn.socket.io/4.7.5/socket.io.min.js',
+                'https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js'
+            ];
+            const chartSources = [
+                'https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js',
+                'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
+                'https://unpkg.com/chart.js@4.4.1/dist/chart.umd.js'
+            ];
+            try {
+                await Promise.all([
+                    loadScriptWithFallback('Socket.IO', socketSources, 'io'),
+                    loadScriptWithFallback('Chart.js', chartSources, 'Chart')
+                ]);
+                console.log('Core libraries loaded, initializing magnetic monitor');
+                initMagneticMonitor();
+            } catch (error) {
+                console.error('Core library loading failed:', error);
+                initMagneticMonitor();
+            }
+        }
+        
+        function initMagneticMonitor() {
+            try {
+                console.log('开始初始化磁场监控...');
+                // 初始化磁场监控
+                magneticMonitor = new MagneticMonitor();
+                // 将magneticMonitor暴露到全局，供ES Module调用
+                window.magneticMonitor = magneticMonitor;
+                console.log('磁场监控初始化成功:', magneticMonitor);
+            } catch (error) {
+                console.error('磁场监控初始化失败:', error);
+            }
+        }
+        
+        // 将initMagneticMonitor暴露到全局，供ES Module调用
+        window.initMagneticMonitor = initMagneticMonitor;
+        
+        // ==================== 1D CNN 缺陷检测功能 ====================
+        
+        /**
+         * 1D CNN 传感器缺陷检测器 - 内联实现
+         */
+        class SensorCNNDetector {
+            constructor() {
+                this.isLoaded = false;
+                this.classNames = ['no_defect', 'crack', 'corrosion', 'pitting', 'scratch', 'deformation', 'blocky', 'columnar'];
+                this.displayLabels = {
+                    no_defect: '无缺陷',
+                    crack: '裂纹',
+                    corrosion: '腐蚀',
+                    pitting: '点蚀',
+                    scratch: '划痕',
+                    deformation: '变形',
+                    blocky: '块状',
+                    columnar: '柱状'
+                };
+            }
+
+            async loadModel() {
+                const response = await fetch('/health', { cache: 'no-store' });
+                let healthData = null;
+                try {
+                    healthData = await response.json();
+                } catch (error) {
+                    throw new Error('云端模型健康检查返回格式错误');
+                }
+
+                if (!response.ok || !healthData.model_loaded) {
+                    const message = healthData && healthData.error ? healthData.error : `HTTP ${response.status}`;
+                    this.isLoaded = false;
+                    throw new Error(`云端模型未就绪: ${message}`);
+                }
+
+                this.isLoaded = true;
+                console.log('云端1D CNN模型已就绪:', healthData);
+            }
+
+            async detect(sensorData) {
+                if (!this.isLoaded) {
+                    throw new Error('云端模型未加载');
+                }
+
+                const startTime = performance.now();
+                const backendSensorData = this.toBackendSensorData(sensorData);
+                const actualSensorCount = this.getActualSensorCount(sensorData);
+                const response = await fetch('/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sensor_data: backendSensorData,
+                        actual_sensor_count: actualSensorCount,
+                        confidence_threshold: this.getConfidenceThreshold()
+                    })
+                });
+
+                let result = null;
+                try {
+                    result = await response.json();
+                } catch (error) {
+                    throw new Error('云端检测返回格式错误');
+                }
+
+                if (!response.ok) {
+                    const message = result && result.error ? result.error : `HTTP ${response.status}`;
+                    throw new Error(`云端检测失败: ${message}`);
+                }
+
+                return this.normalizeBackendResult(result, sensorData, startTime);
+            }
+
+            toBackendSensorData(sensorData) {
+                const values = [];
+                if (Array.isArray(sensorData)) {
+                    sensorData.forEach(item => {
+                        if (item && typeof item === 'object') {
+                            values.push(Number(item.x) || 0, Number(item.y) || 0, Number(item.z) || 0);
+                        } else {
+                            values.push(Number(item) || 0);
+                        }
+                    });
+                }
+
+                while (values.length < 9) {
+                    values.push(0);
+                }
+                return values.slice(0, 9);
+            }
+
+            getActualSensorCount(sensorData) {
+                if (sensorData && Number.isInteger(sensorData.actualCount)) {
+                    return Math.max(0, Math.min(3, sensorData.actualCount));
+                }
+                if (Array.isArray(sensorData)) {
+                    if (sensorData.length > 0 && sensorData.every(item => item && typeof item === 'object')) {
+                        return Math.max(1, Math.min(3, sensorData.length));
+                    }
+                    return Math.max(1, Math.min(3, Math.ceil(sensorData.length / 3)));
+                }
+                return 0;
+            }
+
+            normalizeBackendResult(result, sensorData, startTime) {
+                const probabilities = this.normalizeProbabilities(result.probabilities);
+                const classId = Number.isInteger(result.class_id) ? result.class_id : this.argmax(probabilities);
+                const className = this.classNames[classId] || 'no_defect';
+                const confidence = typeof result.confidence === 'number' ? result.confidence : (probabilities[classId] || 0);
+                const threshold = this.getConfidenceThreshold();
+                const hasDefect = typeof result.has_defect === 'boolean'
+                    ? result.has_defect
+                    : classId !== 0 && confidence >= threshold;
+
+                return {
+                    detections: hasDefect ? [{
+                        classId,
+                        className: this.displayLabels[className] || className,
+                        confidence,
+                        sensorData
+                    }] : [],
+                    inferenceTime: performance.now() - startTime,
+                    count: hasDefect ? 1 : 0,
+                    sensorData,
+                    probabilities: probabilities.map((prob, index) => ({
+                        classId: index,
+                        className: this.displayLabels[this.classNames[index]] || this.classNames[index] || `类别${index}`,
+                        confidence: prob
+                    })),
+                    rawResult: result
+                };
+            }
+
+            normalizeProbabilities(probabilities) {
+                let values = Array.isArray(probabilities) ? probabilities.slice(0, this.classNames.length) : [];
+                while (values.length < this.classNames.length) {
+                    values.push(0);
+                }
+
+                values = values.map(value => Math.max(0, Number(value) || 0));
+                const total = values.reduce((sum, value) => sum + value, 0);
+                if (total > 0) {
+                    return values.map(value => value / total);
+                }
+
+                const fallback = 1 / this.classNames.length;
+                return this.classNames.map(() => fallback);
+            }
+
+            getConfidenceThreshold() {
+                const thresholdSlider = document.getElementById('confThreshold');
+                const value = thresholdSlider ? Number(thresholdSlider.value) : 0.3;
+                return Number.isFinite(value) ? value : 0.3;
+            }
+
+            argmax(values) {
+                let bestIndex = 0;
+                let bestValue = values[0] || 0;
+                values.forEach((value, index) => {
+                    if (value > bestValue) {
+                        bestValue = value;
+                        bestIndex = index;
+                    }
+                });
+                return bestIndex;
+            }
+
+            isModelLoaded() {
+                return this.isLoaded;
+            }
+
+            reset() {
+                this.isLoaded = false;
+            }
+        }
+        let sensorCNNDetector = null;
+        let isRealtimeDetection = false;
+        let realtimeDetectionInterval = null;
+        let currentDetectionMode = null; // 当前检测模式：'plate' 或 'pipe'
+        let pipeScanData = []; // 管状模式的扫描数据
+
+        // 检测历史分页变量
+        let currentHistoryPage = 1;
+        const historyItemsPerPage = 10;
+
+        // 检测间隔控制变量
+        let currentDetectionInterval = 1.0; // 默认1秒
+
+        // 暂停/继续检测相关变量
+        let isDetectionPaused = false; // 是否暂停检测
+        let activeSensorCount = 0; // 当前活动的传感器数量
+
+        // 初始化1D CNN检测器
+        async function initSensorCNNDetector() {
+            try {
+                console.log('🚀 初始化1D CNN检测器...');
+                
+                // 检查SensorCNNDetector类是否已定义（现在已内联）
+                if (typeof SensorCNNDetector === 'undefined') {
+                    console.error('SensorCNNDetector类未定义');
+                    updateCNNStatus('error', 'CNN检测器类未定义');
+                    return false;
+                }
+                
+                sensorCNNDetector = new SensorCNNDetector();
+                
+                // 加载模型
+                await sensorCNNDetector.loadModel();
+                
+                updateCNNStatus('loaded', '模型加载成功');
+                enableCNNButtons(true);
+                console.log('✅ 1D CNN检测器初始化成功');
+                
+                // 初始化模式选择按钮
+                initModeButtons();
+                
+                return true;
+            } catch (error) {
+                console.error('❌ 初始化CNN检测器失败:', error);
+                updateCNNStatus('error', '初始化失败: ' + error.message);
+                return false;
+            }
+        }
+        
+        // 初始化模式选择按钮
+        function initModeButtons() {
+            const plateModeBtn = document.getElementById('plateModeBtn');
+            const pipeModeBtn = document.getElementById('pipeModeBtn');
+            
+            if (plateModeBtn) {
+                plateModeBtn.addEventListener('click', function() {
+                    setDetectionMode('plate');
+                });
+            }
+            
+            if (pipeModeBtn) {
+                pipeModeBtn.addEventListener('click', function() {
+                    setDetectionMode('pipe');
+                });
+            }
+        }
+        
+        // 设置检测模式
+        function setDetectionMode(mode) {
+            currentDetectionMode = mode;
+            const modeStatus = document.getElementById('modeStatus');
+            
+            if (modeStatus) {
+                if (mode === 'plate') {
+                    modeStatus.textContent = '当前模式: 板状模式';
+                    modeStatus.style.color = '#1d4ed8';
+                    // 重置管状模式数据
+                    pipeScanData = [];
+                } else if (mode === 'pipe') {
+                    modeStatus.textContent = '当前模式: 管状模式 - 准备扫描';
+                    modeStatus.style.color = '#a78bfa';
+                    // 重置管状模式数据
+                    pipeScanData = [];
+                }
+            }
+            
+            console.log(`检测模式设置为: ${mode}`);
+        }
+        
+        // 处理管状模式扫描数据
+        function processPipeScanData(sensorData) {
+            // 检查是否是三个传感器同时测量的三个面数据
+            // 格式: [sensor1_data, sensor2_data, sensor3_data]
+            if (Array.isArray(sensorData) && sensorData.length === 3 && Array.isArray(sensorData[0])) {
+                // 三个传感器同时测量的情况
+                console.log('处理三个传感器同时测量的管状数据:', sensorData);
+
+                // 直接使用这三个传感器的数据
+                const mergedData = [];
+                sensorData.forEach(sensor => {
+                    if (Array.isArray(sensor) && sensor.length === 3) {
+                        mergedData.push(...sensor);
+                    }
+                });
+
+                // 确保数据长度为9（3个传感器 × 3个轴）
+                const finalData = mergedData.slice(0, 9);
+
+                // 执行检测，传递isPipeModeFinal=true避免无限递归
+                performCNNDetection(finalData, true);
+
+                // 添加到扫描数据用于后续分析
+                pipeScanData.push(finalData);
+            } else if (Array.isArray(sensorData) && sensorData.length === 9) {
+                // 扁平数组格式 [x1, y1, z1, x2, y2, z2, x3, y3, z3] - 用于实时检测
+                console.log('处理扁平数组格式的管状数据:', sensorData);
+
+                // 执行检测，传递isPipeModeFinal=true避免无限递归
+                performCNNDetection(sensorData, true);
+
+                // 添加到扫描数据用于后续分析
+                pipeScanData.push(sensorData);
+            }
+
+            // 当扫描完成时（假设扫描30组数据点，每组3个传感器）
+            if (pipeScanData.length >= 30) {
+                completePipeScan();
+            }
+        }
+        
+        // 完成管状模式扫描
+        function completePipeScan() {
+            const modeStatus = document.getElementById('modeStatus');
+            if (modeStatus) {
+                modeStatus.textContent = '当前模式: 管状模式 - 扫描完成，正在分析...';
+                modeStatus.style.color = '#a78bfa';
+            }
+            
+            // 分析所有扫描数据
+            if (pipeScanData.length > 0) {
+                // 检查数据格式：如果是9维数据（3个传感器×3个轴）
+                if (pipeScanData[0].length === 9) {
+                    // 三个传感器同时测量的情况
+                    let avgData = new Array(9).fill(0);
+                    let count = 0;
+                    
+                    pipeScanData.forEach(data => {
+                        if (data.length === 9) {
+                            for (let i = 0; i < 9; i++) {
+                                avgData[i] += data[i];
+                            }
+                            count++;
+                        }
+                    });
+                    
+                    if (count > 0) {
+                        avgData = avgData.map(value => value / count);
+                        
+                        // 执行最终检测，传递isPipeModeFinal=true避免无限递归
+                        performCNNDetection(avgData, true);
+                        
+
+                        visualizePipeData(avgData);
+                    }
+                } else {
+                    // 单个传感器数据的情况（保持向后兼容）
+                    let avgX = 0, avgY = 0, avgZ = 0;
+                    let count = 0;
+                    
+                    pipeScanData.forEach(data => {
+                        if (data.length >= 3) {
+                            avgX += data[0];
+                            avgY += data[1];
+                            avgZ += data[2];
+                            count++;
+                        }
+                    });
+                    
+                    if (count > 0) {
+                        avgX /= count;
+                        avgY /= count;
+                        avgZ /= count;
+                        
+                        // 执行最终检测
+                        performCNNDetection([avgX, avgY, avgZ]);
+                    }
+                }
+            }
+            
+            // 重置扫描数据
+            pipeScanData = [];
+            
+            if (modeStatus) {
+                modeStatus.textContent = '当前模式: 管状模式 - 分析完成';
+                modeStatus.style.color = '#2dd4bf';
+            }
+        }
+        
+        // 管状模式数据可视化
+        function visualizePipeData(data) {
+            console.log('可视化管状模式数据:', data);
+        }
+        
+        // 更新CNN状态显示
+        function updateCNNStatus(status, message) {
+            const statusElement = document.getElementById('cnnModelStatus');
+            if (!statusElement) return;
+            
+            const statusColors = {
+                'loading': '#ffa500',
+                'loaded': '#00ff00',
+                'error': '#ff6b6b',
+                'detecting': '#00d4ff'
+            };
+            
+            const statusText = {
+                'loading': '加载中...',
+                'loaded': '已加载',
+                'error': '错误',
+                'detecting': '检测中...'
+            };
+            
+            statusElement.innerHTML = `
+                <div>状态: <span style="color: ${statusColors[status] || '#888'};">${statusText[status] || status}</span></div>
+                <div>模型: 1D CNN</div>
+                <div>类别: 无缺陷、裂纹、腐蚀、点蚀、划痕、变形、块状、柱状</div>
+            `;
+        }
+        
+        // 启用/禁用CNN按钮
+        function enableCNNButtons(enabled) {
+            const testBtn = document.getElementById('testCNNDetectionBtn');
+            const startCollectBtn = document.getElementById('startCollectBtn');
+            const stopCollectBtn = document.getElementById('stopCollectBtn');
+            
+            // 启用/禁用按钮
+            if (testBtn) {
+                testBtn.disabled = !enabled;
+                if (enabled) {
+                    testBtn.style.cursor = 'pointer';
+                    testBtn.style.opacity = '1';
+                } else {
+                    testBtn.style.cursor = 'not-allowed';
+                    testBtn.style.opacity = '0.6';
+                }
+            }
+            if (startCollectBtn) {
+                startCollectBtn.disabled = !enabled;
+                if (enabled) {
+                    startCollectBtn.style.cursor = 'pointer';
+                    startCollectBtn.style.opacity = '1';
+                } else {
+                    startCollectBtn.style.cursor = 'not-allowed';
+                    startCollectBtn.style.opacity = '0.6';
+                }
+            }
+            if (stopCollectBtn) {
+                stopCollectBtn.disabled = !enabled;
+                if (enabled) {
+                    stopCollectBtn.style.cursor = 'pointer';
+                    stopCollectBtn.style.opacity = '1';
+                } else {
+                    stopCollectBtn.style.cursor = 'not-allowed';
+                    stopCollectBtn.style.opacity = '0.6';
+                }
+            }
+        }
+        
+        // 执行CNN检测
+        async function performCNNDetection(sensorData, isPipeModeFinal = false) {
+            if (!sensorCNNDetector) {
+                console.error('CNN检测器未初始化');
+                return null;
+            }
+            
+            try {
+                // 检查当前模式
+                if (currentDetectionMode === 'pipe' && !isPipeModeFinal) {
+                    // 管状模式：处理扫描数据
+                    processPipeScanData(sensorData);
+                    return null; // 管状模式由processPipeScanData处理
+                }
+                
+                // 转换传感器数据格式
+                let formattedSensorData = [];
+                
+                if (sensorData.length === 3) {
+                    // 单传感器三轴格式：[x, y, z]
+                    formattedSensorData = [{
+                        x: sensorData[0],
+                        y: sensorData[1],
+                        z: sensorData[2],
+                        name: '传感器1'
+                    }];
+                } else if (sensorData.length === 9) {
+                    // 真实传感器数据格式：[x1, y1, z1, x2, y2, z2, x3, y3, z3]
+                    for (let i = 0; i < 3; i++) {
+                        formattedSensorData.push({
+                            x: sensorData[i * 3],
+                            y: sensorData[i * 3 + 1],
+                            z: sensorData[i * 3 + 2],
+                            name: `传感器${i + 1}`
+                        });
+                    }
+                } else if (sensorData.length % 3 === 0) {
+                    // 支持任意数量的传感器（1-3个），每个传感器有x、y、z三个值
+                    const sensorCount = sensorData.length / 3;
+                    if (sensorCount >= 1 && sensorCount <= 3) {
+                        for (let i = 0; i < sensorCount; i++) {
+                            formattedSensorData.push({
+                                x: sensorData[i * 3],
+                                y: sensorData[i * 3 + 1],
+                                z: sensorData[i * 3 + 2],
+                                name: `传感器${i + 1}`
+                            });
+                        }
+                    } else {
+                        console.error('传感器数量必须在1-3个之间');
+                        return null;
+                    }
+                }
+                
+                // 如果没有传感器数据，返回null
+                if (formattedSensorData.length === 0) {
+                    console.error('无效的传感器数据格式');
+                    return null;
+                }
+
+                const providedActualCount = sensorData && Number.isInteger(sensorData.actualCount)
+                    ? Math.max(0, Math.min(3, sensorData.actualCount))
+                    : null;
+                const actualSensorCount = providedActualCount !== null ? providedActualCount : formattedSensorData.length;
+                if (actualSensorCount === 0) {
+                    console.warn('没有有效传感器数据，跳过检测');
+                    updateCNNStatus('error', '没有传感器数据');
+                    return null;
+                }
+
+                const actualFormattedSensorData = formattedSensorData.slice(0, actualSensorCount);
+
+                // 对于少于3个传感器的情况，使用现有数据进行填充（仅用于模型输入）
+                const paddedSensorData = [...actualFormattedSensorData];
+                while (paddedSensorData.length < 3) {
+                    // 复制最后一个传感器的数据作为填充
+                    const lastSensor = paddedSensorData[paddedSensorData.length - 1];
+                    paddedSensorData.push({
+                        x: lastSensor.x,
+                        y: lastSensor.y,
+                        z: lastSensor.z,
+                        name: `传感器${paddedSensorData.length + 1}`
+                    });
+                }
+                paddedSensorData.actualCount = actualSensorCount;
+
+                console.log('performCNNDetection - 调用 detect() 前:');
+                console.log('  - paddedSensorData (传给模型):', paddedSensorData);
+                console.log('  - formattedSensorData (实际数据):', actualFormattedSensorData);
+                console.log('  - actualSensorCount:', actualSensorCount);
+
+                const results = await sensorCNNDetector.detect(paddedSensorData);
+
+                console.log('performCNNDetection - detect() 返回后，results.sensorData:', results?.sensorData);
+
+                // 将实际传感器数据（未填充）和实际数量添加到结果中
+                // 必须在这里强制覆盖，因为 detect() 方法内部也设置了 sensorData
+                if (results) {
+                    results.sensorData = actualFormattedSensorData; // 使用未填充的数据
+                    results.actualSensorCount = actualSensorCount;
+                    console.log('performCNNDetection - 覆盖后，results.sensorData:', results.sensorData);
+                    console.log('performCNNDetection - 覆盖后，results.actualSensorCount:', results.actualSensorCount);
+                }
+
+                console.log('performCNNDetection - 最终返回的结果:', results);
+
+                // 更新结果
+                updateCNNResults(results);
+
+                // 添加到历史
+                addDetectionToHistory(results);
+
+                return results;
+            } catch (error) {
+                console.error('检测失败:', error);
+                return null;
+            }
+        }
+        
+        // 更新CNN检测结果
+        function updateCNNResults(results) {
+            const resultsDiv = document.getElementById('cnnDetectionResults');
+            const timeDiv = document.getElementById('cnnInferenceTime');
+
+            if (!resultsDiv) return;
+
+            console.log('updateCNNResults - 接收到的results:', results);
+            console.log('updateCNNResults - probabilities:', results?.probabilities);
+
+            if (!results) {
+                resultsDiv.innerHTML = '<div style="color: #ff6b6b; font-weight: bold;">检测失败</div>';
+            } else {
+                let html = '';
+
+                if (results.count === 0) {
+                    html += '<div style="color: #2dd4bf; font-weight: bold; margin-bottom: 15px;">无缺陷</div>';
+                } else {
+                    results.detections.forEach((det, index) => {
+                        const colors = ['#ff6b6b', '#2dd4bf', '#60a5fa', '#f9ca24', '#a78bfa'];
+                        const color = colors[det.classId % colors.length];
+
+                        html += `
+                            <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px; margin-bottom: 8px; border-left: 3px solid ${color};">
+                                <div style="font-weight: bold; color: ${color};">${index + 1}. ${det.className}</div>
+                                <div style="font-size: 12px; color: #aaa; margin-top: 4px;">
+                                    置信度: ${(det.confidence * 100).toFixed(1)}%
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+
+                // 显示概率分布
+                if (results.probabilities && Array.isArray(results.probabilities)) {
+                    console.log('显示概率分布，数组长度:', results.probabilities.length);
+                    html += '<div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 5px;">';
+                    html += '<h4 style="margin-top: 0; color: #2dd4bf;">类别概率分布:</h4>';
+                    results.probabilities.forEach((item, idx) => {
+                        console.log(`概率项 ${idx}:`, item);
+                        const confidence = typeof item === 'object' ? item.confidence : item;
+                        const className = typeof item === 'object' ? item.className : `类别${idx}`;
+                        const classId = typeof item === 'object' ? item.classId : idx;
+
+                        const barWidth = (confidence * 100).toFixed(0);
+                        const colors = ['#ff6b6b', '#2dd4bf', '#60a5fa', '#f9ca24', '#a78bfa'];
+                        const color = colors[classId % colors.length];
+
+                        html += `
+                            <div style="margin-bottom: 8px;">
+                                <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
+                                    <span>${className}</span>
+                                    <span>${(confidence * 100).toFixed(1)}%</span>
+                                </div>
+                                <div style="height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden;">
+                                    <div style="height: 100%; width: ${barWidth}%; background: ${color}; transition: width 0.3s ease;"></div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                }
+
+                resultsDiv.innerHTML = html;
+            }
+
+            if (timeDiv && results && results.inferenceTime) {
+                timeDiv.textContent = `推理时间: ${results.inferenceTime.toFixed(1)}ms`;
+            }
+
+            // 更新可视化
+            updateCnnVisualization(results);
+        }
+
+        // 实时显示传感器数据
+        function updateRealtimeSensorDisplay() {
+            const visualizationDiv = document.getElementById('cnnVisualization');
+            if (!visualizationDiv) return;
+
+            const sensorData = getRealSensorData();
+            if (!sensorData || sensorData.length === 0) return;
+
+            // 使用actualCount属性获取实际传感器数量
+            const actualSensorCount = sensorData.actualCount || 1;
+
+            // 转换为对象数组格式
+            const formattedSensorData = [];
+            for (let i = 0; i < actualSensorCount; i++) {
+                formattedSensorData.push({
+                    x: sensorData[i * 3] || 0,
+                    y: sensorData[i * 3 + 1] || 0,
+                    z: sensorData[i * 3 + 2] || 0,
+                    name: `传感器${i + 1}`
+                });
+            }
+
+            // 创建可视化内容
+            let html = `
+                <h4 style="margin: 0 0 15px 0; color: #00d4ff;">实时传感器数据</h4>
+                <div style="display: flex; flex-direction: column; gap: 15px;">
+                    <div style="background: rgba(255,255,255,0.05); border-radius: 5px; padding: 10px;">
+                        <h5 style="margin: 0 0 10px 0; color: #2dd4bf;">传感器数据 (${formattedSensorData.length}个)</h5>
+                        <div style="display: grid; grid-template-columns: repeat(${Math.min(formattedSensorData.length, 4)}, 1fr); gap: 10px; font-size: 12px;">
+            `;
+
+            for (let i = 0; i < formattedSensorData.length; i++) {
+                const sensor = formattedSensorData[i];
+                const x = sensor.x !== undefined ? sensor.x.toFixed(2) : '0.00';
+                const y = sensor.y !== undefined ? sensor.y.toFixed(2) : '0.00';
+                const z = sensor.z !== undefined ? sensor.z.toFixed(2) : '0.00';
+
+                html += `
+                    <div style="text-align: center; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 3px;">
+                        <div style="font-weight: bold; color: #00d4ff; margin-bottom: 5px;">${sensor.name}</div>
+                        <div style="color: #ff6b6b;">X: ${x}</div>
+                        <div style="color: #2dd4bf;">Y: ${y}</div>
+                        <div style="color: #60a5fa;">Z: ${z}</div>
+                    </div>
+                `;
+            }
+
+            html += `
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            visualizationDiv.innerHTML = html;
+        }
+
+        // 更新CNN可视化
+        function updateCnnVisualization(results) {
+            const visualizationDiv = document.getElementById('cnnVisualization');
+            if (!visualizationDiv) return;
+
+            if (!results) {
+                visualizationDiv.innerHTML = `
+                    <h4 style="margin: 0 0 10px 0; color: #00d4ff;">检测结果可视化</h4>
+                    <div style="font-size: 14px; line-height: 1.5;">1D CNN 模型直接处理传感器数值数据</div>
+                `;
+                return;
+            }
+
+            console.log('updateCnnVisualization 接收到的 results:', results);
+            console.log('sensorData 类型:', typeof results.sensorData);
+            console.log('sensorData 内容:', results.sensorData);
+
+            // 创建可视化内容
+            let html = `
+                <h4 style="margin: 0 0 15px 0; color: #00d4ff;">检测结果可视化</h4>
+                <div style="display: flex; flex-direction: column; gap: 15px;">
+            `;
+
+            // 传感器数据可视化
+            if (results.sensorData && Array.isArray(results.sensorData) && results.sensorData.length > 0) {
+                console.log('传感器数据:', results.sensorData);
+                console.log('第一个传感器:', results.sensorData[0]);
+
+                // 使用 results.actualSensorCount 属性，如果不存在则使用 sensorData 的长度
+                const actualSensorCount = results.actualSensorCount || results.sensorData.length;
+
+                console.log('实际传感器数量:', actualSensorCount);
+
+                html += `
+                    <div style="background: rgba(255,255,255,0.05); border-radius: 5px; padding: 10px;">
+                        <h5 style="margin: 0 0 10px 0; color: #2dd4bf;">传感器数据 (${actualSensorCount}个)</h5>
+                        <div style="display: grid; grid-template-columns: repeat(${Math.min(actualSensorCount, 4)}, 1fr); gap: 10px; font-size: 12px;">
+                `;
+
+                for (let i = 0; i < actualSensorCount; i++) {
+                    const sensor = results.sensorData[i];
+                    if (!sensor) continue;
+
+                    const x = sensor.x !== undefined ? sensor.x.toFixed(2) : '0.00';
+                    const y = sensor.y !== undefined ? sensor.y.toFixed(2) : '0.00';
+                    const z = sensor.z !== undefined ? sensor.z.toFixed(2) : '0.00';
+                    const name = sensor.name || `传感器${i + 1}`;
+
+                    html += `
+                        <div style="text-align: center; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 3px;">
+                            <div style="font-weight: bold; color: #00d4ff; margin-bottom: 5px;">${name}</div>
+                            <div style="color: #ff6b6b;">X: ${x}</div>
+                            <div style="color: #2dd4bf;">Y: ${y}</div>
+                            <div style="color: #60a5fa;">Z: ${z}</div>
+                        </div>
+                    `;
+                }
+
+                html += `
+                        </div>
+                    </div>
+                `;
+            } else {
+                console.warn('sensorData 为空或不是数组:', results.sensorData);
+            }
+            
+            // 检测结果可视化
+            if (results.count === 0) {
+                html += `
+                    <div style="padding: 20px; background: rgba(78, 205, 196, 0.1); border-radius: 5px; text-align: center;">
+                        <div style="font-size: 16px; font-weight: bold; color: #2dd4bf; margin-bottom: 10px;">无缺陷</div>
+                        <div style="color: #888; font-size: 12px;">未检测到缺陷</div>
+                    </div>
+                `;
+            } else {
+                results.detections.forEach((det, index) => {
+                    const colors = ['#ff6b6b', '#2dd4bf', '#60a5fa', '#f9ca24', '#a78bfa'];
+                    const color = colors[det.classId % colors.length];
+                    const confidence = (det.confidence * 100).toFixed(1);
+                    // 根据置信度值获取进度条颜色（使用更鲜艳的颜色）
+                    let barColor = '#ff3366'; // 红色 - 低置信度
+                    let barShadow = '0 0 8px rgba(255, 51, 102, 0.6)';
+                    if (det.confidence >= 0.66) {
+                        barColor = '#00ff88'; // 绿色 - 高置信度
+                        barShadow = '0 0 8px rgba(0, 255, 136, 0.6)';
+                    } else if (det.confidence >= 0.33) {
+                        barColor = '#ffcc00'; // 黄色 - 中置信度
+                        barShadow = '0 0 8px rgba(255, 204, 0, 0.6)';
+                    }
+                    
+                    html += `
+                        <div style="padding: 15px; background: rgba(255,255,255,0.05); border-radius: 5px; border-left: 4px solid ${color};">
+                            <div style="font-size: 14px; font-weight: bold; color: ${color}; margin-bottom: 10px;">${det.className}</div>
+                            <div style="display: flex; align-items: center; gap: 12px;">
+                                <div style="flex: 1;">
+                                    <div style="height: 14px; background: rgba(255,255,255,0.15); border-radius: 7px; overflow: hidden; border: 1px solid rgba(255,255,255,0.2);">
+                                        <div style="height: 100%; width: ${confidence}%; background: ${barColor}; transition: width 0.3s ease; border-radius: 6px; box-shadow: ${barShadow};"></div>
+                                    </div>
+                                </div>
+                                <div style="font-size: 14px; font-weight: bold; color: ${barColor}; min-width: 60px; text-align: right;">${confidence}%</div>
+                            </div>
+                        </div>
+                    `;
+                });
+            }
+            
+            html += `
+                </div>
+            `;
+            
+            visualizationDiv.innerHTML = html;
+        }
+        
+        // 更新历史记录显示
+        function updateHistoryDisplay() {
+            const historyDiv = document.getElementById('cnnDetectionHistory');
+            if (!historyDiv) return;
+
+            const totalItems = allDetectionResults.length;
+            const totalPages = Math.ceil(totalItems / historyItemsPerPage) || 1;
+
+            // 确保当前页码有效
+            if (currentHistoryPage > totalPages) currentHistoryPage = totalPages;
+            if (currentHistoryPage < 1) currentHistoryPage = 1;
+
+            // 更新页码信息
+            const pageInfo = document.getElementById('historyPageInfo');
+            if (pageInfo) {
+                pageInfo.textContent = `第 ${currentHistoryPage}/${totalPages} 页 (共 ${totalItems} 条)`;
+            }
+
+            // 更新翻页按钮状态
+            const prevBtn = document.getElementById('historyPrevBtn');
+            const nextBtn = document.getElementById('historyNextBtn');
+
+            if (prevBtn) {
+                prevBtn.disabled = currentHistoryPage <= 1;
+                prevBtn.style.opacity = currentHistoryPage <= 1 ? '0.5' : '1';
+                prevBtn.style.cursor = currentHistoryPage <= 1 ? 'not-allowed' : 'pointer';
+            }
+
+            if (nextBtn) {
+                nextBtn.disabled = currentHistoryPage >= totalPages;
+                nextBtn.style.opacity = currentHistoryPage >= totalPages ? '0.5' : '1';
+                nextBtn.style.cursor = currentHistoryPage >= totalPages ? 'not-allowed' : 'pointer';
+            }
+
+            // 显示当前页的数据
+            if (totalItems === 0) {
+                historyDiv.innerHTML = '<div style="color: #666; text-align: center; transition: all 0.3s ease;">暂无检测记录</div>';
+                return;
+            }
+
+            const startIndex = (currentHistoryPage - 1) * historyItemsPerPage;
+            const endIndex = Math.min(startIndex + historyItemsPerPage, totalItems);
+            const pageData = allDetectionResults.slice().reverse().slice(startIndex, endIndex);
+
+            historyDiv.innerHTML = '';
+            pageData.forEach((item, index) => {
+                const results = item.results;
+                const hasDefect = results && results.count > 0;
+                const inferenceTime = results && results.inferenceTime ? results.inferenceTime : 0;
+                const historyItem = document.createElement('div');
+                historyItem.style.cssText = 'padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 11px; display: flex; justify-content: space-between; align-items: center;';
+                historyItem.innerHTML = `
+                    <div style="flex: 1;">
+                        <span style="color: #666; font-weight: bold;">#${startIndex + index + 1}</span>
+                        <span style="color: #888; margin-left: 8px;">[${item.timestamp}]</span>
+                        <span style="color: ${hasDefect ? '#2dd4bf' : '#888'}; font-weight: bold;">${item.resultText}</span>
+                    </div>
+                    <span style="color: #666; font-size: 10px;">${inferenceTime.toFixed(0)}ms</span>
+                `;
+                historyDiv.appendChild(historyItem);
+            });
+        }
+
+        // 绑定历史记录翻页事件
+        function bindHistoryPaginationEvents() {
+            const prevBtn = document.getElementById('historyPrevBtn');
+            const nextBtn = document.getElementById('historyNextBtn');
+
+            if (prevBtn) {
+                prevBtn.addEventListener('click', () => {
+                    if (currentHistoryPage > 1) {
+                        currentHistoryPage--;
+                        updateHistoryDisplay();
+                    }
+                });
+            }
+
+            if (nextBtn) {
+                nextBtn.addEventListener('click', () => {
+                    const totalPages = Math.ceil(allDetectionResults.length / historyItemsPerPage) || 1;
+                    if (currentHistoryPage < totalPages) {
+                        currentHistoryPage++;
+                        updateHistoryDisplay();
+                    }
+                });
+            }
+        }
+
+        // 更新检测间隔显示
+        function updateDetectionIntervalDisplay(interval) {
+            console.log('📊 updateDetectionIntervalDisplay 被调用，间隔:', interval);
+            const display = document.getElementById('currentIntervalDisplay');
+            if (display) {
+                display.textContent = `${interval}秒`;
+                console.log('✅ 更新显示文本为:', `${interval}秒`);
+            } else {
+                console.error('❌ 找不到 currentIntervalDisplay 元素');
+            }
+
+            // 更新按钮激活状态
+            const interval1sBtn = document.getElementById('interval1sBtn');
+            const interval2sBtn = document.getElementById('interval2sBtn');
+            const interval3sBtn = document.getElementById('interval3sBtn');
+
+            console.log('🔍 按钮元素:', {
+                interval1sBtn: interval1sBtn ? '存在' : '不存在',
+                interval2sBtn: interval2sBtn ? '存在' : '不存在',
+                interval3sBtn: interval3sBtn ? '存在' : '不存在'
+            });
+
+            if (interval1sBtn) {
+                if (interval === 1) {
+                    interval1sBtn.classList.add('active');
+                    console.log('✅ 1秒按钮添加 active 类');
+                } else {
+                    interval1sBtn.classList.remove('active');
+                    console.log('➖ 1秒按钮移除 active 类');
+                }
+            }
+
+            if (interval2sBtn) {
+                if (interval === 2) {
+                    interval2sBtn.classList.add('active');
+                    console.log('✅ 2秒按钮添加 active 类');
+                } else {
+                    interval2sBtn.classList.remove('active');
+                    console.log('➖ 2秒按钮移除 active 类');
+                }
+            }
+
+            if (interval3sBtn) {
+                if (interval === 3) {
+                    interval3sBtn.classList.add('active');
+                    console.log('✅ 3秒按钮添加 active 类');
+                } else {
+                    interval3sBtn.classList.remove('active');
+                    console.log('➖ 3秒按钮移除 active 类');
+                }
+            }
+        }
+
+        function getMappedActiveSensorIds() {
+            if (!magneticMonitor || !magneticMonitor.deviceData) {
+                return [];
+            }
+
+            const mapping = magneticMonitor.sensorDisplayMapping || {};
+            const availableIds = Object.keys(magneticMonitor.deviceData);
+            const orderedIds = [];
+
+            for (let displayPos = 1; displayPos <= 3; displayPos++) {
+                const mappedId = mapping[`display${displayPos}`];
+                if (mappedId && magneticMonitor.deviceData[mappedId] && !orderedIds.includes(mappedId)) {
+                    orderedIds.push(mappedId);
+                }
+            }
+
+            availableIds.forEach(deviceId => {
+                if (!orderedIds.includes(deviceId)) {
+                    orderedIds.push(deviceId);
+                }
+            });
+
+            return orderedIds.filter(deviceId => {
+                const sensor = magneticMonitor.deviceData[deviceId];
+                return sensor && sensor.xData && sensor.xData.length > 0;
+            });
+        }
+
+        // 设置检测间隔
+        function setDetectionInterval(interval) {
+            console.log('🔧 setDetectionInterval 被调用，间隔:', interval);
+            currentDetectionInterval = interval;
+            updateDetectionIntervalDisplay(interval);
+
+            if (realtimeDetectionInterval) {
+                console.log(`🔄 更新检测间隔为 ${interval} 秒`);
+                stopRealtimeDetection();
+                startRealtimeDetection();
+            }
+        }
+
+        // 绑定CNN按钮事件
+        function bindCNNEvents() {
+            // 加载模型按钮
+            const loadBtn = document.getElementById('loadCNNModelBtn');
+            if (loadBtn) {
+                loadBtn.addEventListener('click', async function(event) {
+                    this.disabled = true;
+                    this.textContent = '📥 加载中...';
+                    updateCNNStatus('loading', '正在加载模型...');
+                    
+                    // 显示模型加载状态指示器
+                    const modelLoadingStatus = document.getElementById('modelLoadingStatus');
+                    if (modelLoadingStatus) {
+                        modelLoadingStatus.style.display = 'block';
+                    }
+                    
+                    const success = await initSensorCNNDetector();
+                    
+                    // 隐藏模型加载状态指示器
+                    if (modelLoadingStatus) {
+                        modelLoadingStatus.style.display = 'none';
+                    }
+                    
+                    if (success) {
+                        this.textContent = '✅ 模型已加载';
+                        this.style.background = 'linear-gradient(135deg, #00b894 0%, #00cec9 100%)';
+                    } else {
+                        this.disabled = false;
+                        this.textContent = '📥 加载1D CNN模型';
+                    }
+                });
+            }
+            
+            // 测试检测按钮
+            const testBtn = document.getElementById('testCNNDetectionBtn');
+            if (testBtn) {
+                testBtn.addEventListener('click', async function(event) {
+                    // 检查是否有活动连接
+                    let hasActiveConnection = false;
+                    
+                    try {
+                        if (magneticMonitor && magneticMonitor.connections) {
+                            const connectionValues = Object.values(magneticMonitor.connections);
+                            hasActiveConnection = connectionValues.some(conn => conn && conn.connected);
+                        }
+                    } catch (error) {
+                        console.error('检查连接状态时出错:', error);
+                        hasActiveConnection = false;
+                    }
+                    
+                    if (!hasActiveConnection) {
+                        alert('请先连接传感器设备');
+                        return;
+                    }
+                    
+                    // 检查是否开始接收数据
+                    if (!magneticMonitor || !magneticMonitor.isReceivingData) {
+                        alert('请先开始接收数据');
+                        return;
+                    }
+                    
+                    // 获取实时传感器数据
+                    const sensorData = magneticMonitor.getAllSensorData();
+                    
+                    updateCNNStatus('detecting', '正在检测...');
+                    await performCNNDetection(sensorData);
+                    updateCNNStatus('loaded', '检测完成');
+                });
+            }
+            
+            // 开始检测按钮
+            const startCollectBtn = document.getElementById('startCollectBtn');
+            if (startCollectBtn) {
+                startCollectBtn.addEventListener('click', function(event) {
+                    // 检查是否有活动连接
+                    let hasActiveConnection = false;
+
+                    try {
+                        if (magneticMonitor && magneticMonitor.connections) {
+                            const connectionValues = Object.values(magneticMonitor.connections);
+                            hasActiveConnection = connectionValues.some(conn => conn && conn.connected);
+                        }
+                    } catch (error) {
+                        console.error('检查连接状态时出错:', error);
+                        hasActiveConnection = false;
+                    }
+
+                    if (!hasActiveConnection) {
+                        alert('请先连接传感器设备');
+                        return;
+                    }
+
+                    // 检查是否开始接收数据
+                    if (!magneticMonitor || !magneticMonitor.isReceivingData) {
+                        alert('请先开始接收数据');
+                        return;
+                    }
+
+                    // 检查是否选择了检测模式
+                    const modeStatus = document.getElementById('modeStatus');
+                    if (modeStatus && modeStatus.textContent.includes('未选择')) {
+                        alert('请先选择检测模式');
+                        return;
+                    }
+
+                    // 计算实际连接的传感器数量
+                    const activeSensors = getMappedActiveSensorIds();
+                    activeSensorCount = activeSensors.length;
+                    console.log('实际连接的传感器数量:', activeSensorCount);
+
+                    // 根据传感器数量显示/隐藏检测间隔控制和暂停按钮
+                    const intervalControlContainer = document.getElementById('intervalControlContainer');
+                    const pauseDetectionBtn = document.getElementById('pauseDetectionBtn');
+
+                    if (activeSensorCount > 1) {
+                        // 多传感器：显示间隔控制，隐藏暂停按钮
+                        if (intervalControlContainer) {
+                            intervalControlContainer.style.display = 'block';
+                            console.log('✅ 显示检测间隔控制（多传感器）');
+                        }
+                        if (pauseDetectionBtn) {
+                            pauseDetectionBtn.style.display = 'none';
+                            console.log('❌ 隐藏暂停按钮（多传感器）');
+                        }
+                    } else {
+                        // 单传感器：隐藏间隔控制，显示暂停按钮
+                        if (intervalControlContainer) {
+                            intervalControlContainer.style.display = 'none';
+                            console.log('❌ 隐藏检测间隔控制（单传感器）');
+                        }
+                        if (pauseDetectionBtn) {
+                            pauseDetectionBtn.style.display = 'block';
+                            pauseDetectionBtn.disabled = false;
+                            pauseDetectionBtn.textContent = '⏸️ 暂停检测';
+                            isDetectionPaused = false;
+                            console.log('✅ 显示暂停按钮（单传感器）');
+                        }
+                    }
+
+                    // 隐藏开始按钮，显示停止按钮
+                    startCollectBtn.style.display = 'none';
+                    const stopCollectBtn = document.getElementById('stopCollectBtn');
+                    if (stopCollectBtn) {
+                        stopCollectBtn.style.display = 'block';
+                        stopCollectBtn.disabled = false;
+                    }
+
+                    // 开始收集数据
+                    startDataCollection();
+                });
+            }
+            
+            // 停止检测按钮
+            const stopCollectBtn = document.getElementById('stopCollectBtn');
+            if (stopCollectBtn) {
+                stopCollectBtn.addEventListener('click', async function(event) {
+                    // 停止实时检测（如果正在运行）
+                    stopRealtimeDetection();
+
+                    // 停止收集数据
+                    await stopDataCollection();
+
+                    // 重置状态
+                    isCollectingData = false;
+                    isDetectionPaused = false;
+
+                    // 重置开始按钮
+                    const startBtn = document.getElementById('startCollectBtn');
+                    if (startBtn) {
+                        startBtn.textContent = '📊 开始检测';
+                        startBtn.style.background = 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)';
+                        startBtn.disabled = false;
+                    }
+
+                    // 隐藏停止按钮和暂停按钮，显示开始按钮
+                    if (stopCollectBtn) {
+                        stopCollectBtn.style.display = 'none';
+                    }
+                    const pauseDetectionBtn = document.getElementById('pauseDetectionBtn');
+                    if (pauseDetectionBtn) {
+                        pauseDetectionBtn.style.display = 'none';
+                    }
+                    if (startBtn) {
+                        startBtn.style.display = 'block';
+                    }
+                });
+            }
+
+            // 暂停/继续检测按钮
+            const pauseDetectionBtn = document.getElementById('pauseDetectionBtn');
+            if (pauseDetectionBtn) {
+                pauseDetectionBtn.addEventListener('click', function(event) {
+                    // 只在单传感器模式下允许暂停
+                    if (activeSensorCount > 1) {
+                        console.log('⚠️ 多传感器模式，暂停功能已禁用');
+                        return;
+                    }
+
+                    isDetectionPaused = !isDetectionPaused;
+
+                    if (isDetectionPaused) {
+                        pauseDetectionBtn.textContent = '▶️ 继续检测';
+                        pauseDetectionBtn.style.background = 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
+                        console.log('⏸️ 检测已暂停，数据仍在接收但不被模型收集');
+                    } else {
+                        pauseDetectionBtn.textContent = '⏸️ 暂停检测';
+                        pauseDetectionBtn.style.background = 'linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%)';
+                        console.log('▶️ 检测已继续');
+                    }
+                });
+            }
+            
+            // 置信度阈值拖动条
+            const thresholdSlider = document.getElementById('confThreshold');
+            const valueDisplay = document.getElementById('confValue');
+            const thresholdFill = document.getElementById('confThresholdFill');
+            const thresholdThumb = document.getElementById('confThresholdThumb');
+            
+            if (thresholdSlider && valueDisplay) {
+                // 初始值设置
+                valueDisplay.textContent = thresholdSlider.value;
+                
+                // 更新填充条和圆点位置（无过渡动画，确保拖动流畅）
+                function updateSliderVisual(value) {
+                    const percentage = parseFloat(value) * 100;
+                    if (thresholdFill) {
+                        thresholdFill.style.width = percentage + '%';
+                        thresholdFill.style.transition = 'none';
+                    }
+                    if (thresholdThumb) {
+                        thresholdThumb.style.left = percentage + '%';
+                        thresholdThumb.style.transition = 'none';
+                    }
+                }
+                
+                // 初始更新
+                updateSliderVisual(thresholdSlider.value);
+                
+                // 添加拖动事件监听器
+                thresholdSlider.addEventListener('input', function() {
+                    const value = this.value;
+                    valueDisplay.textContent = value;
+                    
+                    // 更新填充条和圆点
+                    updateSliderVisual(value);
+                });
+                
+                // 添加改变事件监听器（用于最终值确认）
+                thresholdSlider.addEventListener('change', function() {
+                    console.log('置信度阈值已更新:', this.value);
+                });
+            }
+
+            // 检测间隔按钮事件绑定
+            const interval1sBtn = document.getElementById('interval1sBtn');
+            const interval2sBtn = document.getElementById('interval2sBtn');
+            const interval3sBtn = document.getElementById('interval3sBtn');
+
+            console.log('🔧 绑定检测间隔按钮事件:', {
+                interval1sBtn: interval1sBtn ? '找到' : '未找到',
+                interval2sBtn: interval2sBtn ? '找到' : '未找到',
+                interval3sBtn: interval3sBtn ? '找到' : '未找到'
+            });
+
+            if (interval1sBtn) {
+                interval1sBtn.addEventListener('click', function() {
+                    if (activeSensorCount <= 1) {
+                        console.log('⚠️ 单传感器模式，检测间隔功能已禁用');
+                        return;
+                    }
+                    console.log('🖱️ 1秒按钮被点击');
+                    setDetectionInterval(1);
+                });
+            }
+            if (interval2sBtn) {
+                interval2sBtn.addEventListener('click', function() {
+                    if (activeSensorCount <= 1) {
+                        console.log('⚠️ 单传感器模式，检测间隔功能已禁用');
+                        return;
+                    }
+                    console.log('🖱️ 2秒按钮被点击');
+                    setDetectionInterval(2);
+                });
+            }
+            if (interval3sBtn) {
+                interval3sBtn.addEventListener('click', function() {
+                    if (activeSensorCount <= 1) {
+                        console.log('⚠️ 单传感器模式，检测间隔功能已禁用');
+                        return;
+                    }
+                    console.log('🖱️ 3秒按钮被点击');
+                    setDetectionInterval(3);
+                });
+            }
+
+
+            // 导出历史记录按钮
+            const exportHistoryBtn = document.getElementById('exportHistoryBtn');
+            if (exportHistoryBtn) {
+                exportHistoryBtn.addEventListener('click', function() {
+                    // 创建导出菜单
+                    const menu = document.createElement('div');
+                    menu.style.cssText = 'position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; border-radius: 8px; padding: 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); z-index: 10000; min-width: 200px;';
+                    menu.innerHTML = `
+                        <div style="margin-bottom: 12px; font-weight: bold; color: #333;">选择导出格式</div>
+                        <button style="width: 100%; padding: 10px; margin-bottom: 8px; background: #4facfe; color: white; border: none; border-radius: 6px; cursor: pointer;">📄 导出为 JSON</button>
+                        <button style="width: 100%; padding: 10px; margin-bottom: 8px; background: #4facfe; color: white; border: none; border-radius: 6px; cursor: pointer;">📊 导出为 CSV</button>
+                        <button style="width: 100%; padding: 10px; background: #999; color: white; border: none; border-radius: 6px; cursor: pointer;">取消</button>
+                    `;
+
+                    const buttons = menu.querySelectorAll('button');
+                    buttons[0].addEventListener('click', function() {
+                        exportDetectionHistory();
+                        document.body.removeChild(menu);
+                    });
+                    buttons[1].addEventListener('click', function() {
+                        exportDetectionHistoryCSV();
+                        document.body.removeChild(menu);
+                    });
+                    buttons[2].addEventListener('click', function() {
+                        document.body.removeChild(menu);
+                    });
+
+                    document.body.appendChild(menu);
+                });
+            }
+
+            // 清空历史记录按钮
+            const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+            if (clearHistoryBtn) {
+                clearHistoryBtn.addEventListener('click', function() {
+                    clearDetectionHistory();
+                });
+            }
+
+            // 分页按钮事件处理
+            const prevPageBtn = document.getElementById('prevPageBtn');
+            const nextPageBtn = document.getElementById('nextPageBtn');
+            const jumpPageBtn = document.getElementById('jumpPageBtn');
+            const jumpPageInput = document.getElementById('jumpPageInput');
+
+            if (prevPageBtn) {
+                prevPageBtn.addEventListener('click', function() {
+                    if (currentResultPage > 0) {
+                        currentResultPage--;
+                        displayDetectionResults();
+                    }
+                });
+            }
+
+            if (nextPageBtn) {
+                nextPageBtn.addEventListener('click', function() {
+                    if (currentResultPage < allDetectionResults.length - 1) {
+                        currentResultPage++;
+                        displayDetectionResults();
+                    }
+                });
+            }
+
+            if (jumpPageBtn) {
+                jumpPageBtn.addEventListener('click', function() {
+                    const pageNum = parseInt(jumpPageInput.value);
+                    const totalPages = Math.ceil(allDetectionResults.length / 1);
+
+                    if (isNaN(pageNum) || pageNum < 1 || pageNum > totalPages) {
+                        alert(`请输入1到${totalPages}之间的页码`);
+                        return;
+                    }
+
+                    currentResultPage = pageNum - 1;
+                    displayDetectionResults();
+                    jumpPageInput.value = '';
+                });
+            }
+
+            if (jumpPageInput) {
+                jumpPageInput.addEventListener('keypress', function(event) {
+                    if (event.key === 'Enter') {
+                        jumpPageBtn.click();
+                    }
+                });
+            }
+
+            // 初始化检测结果模块优化
+            bindHistoryPaginationEvents();
+            updateDetectionIntervalDisplay(currentDetectionInterval);
+            updateHistoryDisplay();
+            console.log('✅ 检测结果模块优化已加载');
+        }
+        
+        // 获取真实传感器数据
+        function getRealSensorData() {
+            if (magneticMonitor) {
+                let hasActiveConnection = false;
+
+                try {
+                    if (magneticMonitor.connections) {
+                        const connectionValues = Object.values(magneticMonitor.connections);
+                        hasActiveConnection = connectionValues.some(conn => conn && conn.connected);
+                    }
+                } catch (error) {
+                    console.error('检查连接状态时出错:', error);
+                    hasActiveConnection = false;
+                }
+
+                let sensorData = [];
+
+                console.log('[getRealSensorData] hasActiveConnection:', hasActiveConnection);
+                console.log('[getRealSensorData] magneticMonitor.deviceData:', magneticMonitor.deviceData);
+
+                if (hasActiveConnection && magneticMonitor.deviceData) {
+                    // 直接遍历 deviceData 中实际存在的键
+                    const activeSensors = [];
+
+                    for (const deviceKey in magneticMonitor.deviceData) {
+                        const sensor = magneticMonitor.deviceData[deviceKey];
+                        console.log(`[getRealSensorData] 检查 ${deviceKey}:`, sensor);
+                        if (sensor && sensor.xData && sensor.xData.length > 0) {
+                            activeSensors.push(deviceKey);
+                        }
+                    }
+
+                    console.log('[getRealSensorData] activeSensors:', activeSensors);
+
+                    for (const deviceKey of activeSensors) {
+                        const sensor = magneticMonitor.deviceData[deviceKey] || { xData: [], yData: [], zData: [] };
+                        const x = sensor.xData.length > 0 ? sensor.xData[sensor.xData.length - 1] : 0;
+                        const y = sensor.yData.length > 0 ? sensor.yData[sensor.yData.length - 1] : 0;
+                        const z = sensor.zData.length > 0 ? sensor.zData[sensor.zData.length - 1] : 0;
+                        console.log(`[getRealSensorData] ${deviceKey}: xData长度=${sensor.xData.length}, yData长度=${sensor.yData.length}, zData长度=${sensor.zData.length}, 值=(${x}, ${y}, ${z})`);
+                        sensorData.push(x, y, z);
+                    }
+
+                    // 只在实际传感器数量不足时填充到9个值（用于后端检测）
+                    // 但保留实际传感器数量信息
+                    const actualSensorCount = activeSensors.length;
+                    while (sensorData.length < 9) {
+                        sensorData.push(0, 0, 0);
+                    }
+                    // 添加实际传感器数量标记
+                    sensorData.actualCount = actualSensorCount;
+                } else if (magneticMonitor.currentValues) {
+                    console.log('[getRealSensorData] 使用 currentValues:', magneticMonitor.currentValues);
+                    const { x, y, z } = magneticMonitor.currentValues;
+                    sensorData = [x, y, z, x, y, z, x, y, z];
+                    sensorData.actualCount = 1;
+                } else if (magneticMonitor.xData && magneticMonitor.xData.length > 0) {
+                    console.log('[getRealSensorData] 使用 xData/yData/zData');
+                    const x = magneticMonitor.xData[magneticMonitor.xData.length - 1] || 0;
+                    const y = magneticMonitor.yData[magneticMonitor.yData.length - 1] || 0;
+                    const z = magneticMonitor.zData[magneticMonitor.zData.length - 1] || 0;
+                    sensorData = [x, y, z, x, y, z, x, y, z];
+                    sensorData.actualCount = 1;
+                } else {
+                    console.log('[getRealSensorData] 返回默认全0数据');
+                    sensorData = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+                    sensorData.actualCount = 1;
+                }
+
+                return sensorData;
+            }
+            return [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        }
+
+        // 开始实时检测
+        function startRealtimeDetection() {
+            if (!sensorCNNDetector) {
+                console.error('CNN检测器未初始化');
+                return;
+            }
+
+            // 检查是否有活动连接
+            let hasActiveConnection = false;
+
+            try {
+                if (magneticMonitor && magneticMonitor.connections) {
+                    const connectionValues = Object.values(magneticMonitor.connections);
+                    hasActiveConnection = connectionValues.some(conn => conn && conn.connected);
+                }
+            } catch (error) {
+                console.error('检查连接状态时出错:', error);
+                hasActiveConnection = false;
+            }
+
+            if (!hasActiveConnection) {
+                console.warn('没有活动连接，无法进行实时检测');
+                updateCNNStatus('error', '没有活动连接');
+                return;
+            }
+
+            // 检查是否开始接收数据
+            if (!magneticMonitor || !magneticMonitor.isReceivingData) {
+                console.warn('没有开始接收数据，无法进行实时检测');
+                updateCNNStatus('error', '没有开始接收数据');
+                return;
+            }
+
+            console.log(`🔄 开始实时检测 (间隔: ${currentDetectionInterval}秒)`);
+
+            realtimeDetectionInterval = setInterval(async () => {
+                // 如果检测被暂停，跳过本次检测但继续接收数据
+                if (isDetectionPaused) {
+                    console.log('⏸️ 检测已暂停，跳过本次检测');
+                    return;
+                }
+
+                // 从真实传感器获取数据
+                const sensorData = getRealSensorData();
+
+                // 检查是否有传感器数据
+                if (sensorData === null) {
+                    console.warn('没有传感器数据，无法进行检测');
+                    // 更新状态显示
+                    updateCNNStatus('error', '没有传感器数据');
+                    return;
+                }
+
+                await performCNNDetection(sensorData);
+            }, currentDetectionInterval * 1000); // 使用动态检测间隔
+        }
+        
+        // 停止实时检测
+        function stopRealtimeDetection() {
+            console.log('🛑 停止实时检测');
+            if (realtimeDetectionInterval) {
+                clearInterval(realtimeDetectionInterval);
+                realtimeDetectionInterval = null;
+            }
+        }
+        
+        // 全局变量用于数据收集
+        let collectedSensorData = [];
+        let dataCollectionInterval = null;
+        let segmentDetectionInterval = null;
+        let realtimeSensorDisplayInterval = null;
+        let segmentStartTime = null;
+        let currentSegmentData = [];
+        let detectionInterval = 2000; // 检测间隔（毫秒），默认2秒
+        let detectionStartTime = null; // 检测开始时间
+        let detectionSegmentCount = 0; // 已完成的分段数
+
+        // 新增：检测结果分页相关变量
+        let allDetectionResults = [];           // 所有检测结果
+        let currentResultPage = 0;              // 当前页码
+        const MAX_DETECTION_HISTORY = 200;
+        const MAX_COLLECTION_POINTS = 600;
+        const MAX_ANNOTATION_SAMPLES = 500;
+
+        // 开始收集数据
+        function startDataCollection() {
+            console.log('📊 开始收集数据，检测间隔:', detectionInterval, 'ms');
+
+            if (dataCollectionInterval) {
+                console.warn('数据收集已在进行中');
+                return;
+            }
+
+            // 重置数据
+            collectedSensorData = [];
+            currentSegmentData = [];
+            segmentStartTime = Date.now();
+            detectionStartTime = Date.now();
+            detectionSegmentCount = 0;
+            isCollectingData = true;
+            currentSampleLabel = null;
+
+            const startCollectionBtn = document.getElementById('startCollectionBtn');
+            const stopCollectionBtn = document.getElementById('stopCollectionBtn');
+            const collectionStatus = document.getElementById('collectionStatus');
+            if (startCollectionBtn) {
+                startCollectionBtn.disabled = true;
+                startCollectionBtn.style.cursor = 'not-allowed';
+                startCollectionBtn.style.opacity = '0.6';
+            }
+            if (stopCollectionBtn) {
+                stopCollectionBtn.disabled = false;
+                stopCollectionBtn.style.cursor = 'pointer';
+                stopCollectionBtn.style.opacity = '1';
+            }
+            if (collectionStatus) {
+                collectionStatus.textContent = '状态: 正在收集';
+            }
+
+            updateCNNStatus('loading', '正在收集数据...');
+
+            // 计算实际连接的传感器数量
+            const activeSensors = getMappedActiveSensorIds();
+            const activeSensorCount = activeSensors.length;
+            console.log('实际连接的传感器数量:', activeSensorCount);
+
+            let dataCollectionCount = 0;
+            // 每100毫秒收集一次数据
+            dataCollectionInterval = setInterval(() => {
+                const sensorData = getRealSensorData();
+                if (sensorData && sensorData.length > 0) {
+                    dataCollectionCount++;
+                    if (dataCollectionCount % 10 === 0) { // 每10次打印一次日志，避免日志过多
+                        console.log(`📊 数据收集 #${dataCollectionCount} - 数据长度: ${sensorData.length}, currentSegmentData: ${currentSegmentData.length}, collectedSensorData: ${collectedSensorData.length}`);
+                    }
+                    currentSegmentData.push(sensorData);
+                    collectedSensorData.push(sensorData);
+                    if (currentSegmentData.length > MAX_COLLECTION_POINTS) {
+                        currentSegmentData.splice(0, currentSegmentData.length - MAX_COLLECTION_POINTS);
+                    }
+                    if (collectedSensorData.length > MAX_COLLECTION_POINTS) {
+                        collectedSensorData.splice(0, collectedSensorData.length - MAX_COLLECTION_POINTS);
+                    }
+                }
+            }, 100);
+
+            // 每200毫秒更新一次实时传感器显示
+            realtimeSensorDisplayInterval = setInterval(() => {
+                updateRealtimeSensorDisplay();
+            }, 200);
+
+            // 只有在传感器数量 > 1 时，才启动分段检测间隔
+            if (activeSensorCount > 1) {
+                console.log('多传感器模式，启动分段检测间隔');
+                // 按照设定的间隔进行分段检测
+                segmentDetectionInterval = setInterval(async () => {
+                    if (currentSegmentData.length > 0) {
+                        detectionSegmentCount++;
+                        console.log(`📊 分段检测 #${detectionSegmentCount} - 收集到 ${currentSegmentData.length} 个数据点`);
+
+                        // 计算当前分段的平均数据
+                        const avgData = calculateAverageData(currentSegmentData);
+
+                        // 执行检测
+                        updateCNNStatus('detecting', '正在检测...');
+                        try {
+                            const results = await performCNNDetection(avgData);
+                            if (results) {
+                                console.log('分段检测完成:', results);
+                            }
+                            updateCNNStatus('loaded', '检测完成');
+                        } catch (error) {
+                            console.error('分段检测出错:', error);
+                            updateCNNStatus('error', '检测出错');
+                        }
+
+                        // 清空当前分段数据，准备下一个分段
+                        currentSegmentData = [];
+                    } else {
+                        console.log('⚠️ 当前分段无数据');
+                    }
+                }, detectionInterval); // 使用可配置的检测间隔
+            } else {
+                console.log('单传感器模式，不启动分段检测间隔，等待停止按钮');
+            }
+        }
+        
+        // 停止收集数据并进行预测
+        async function stopDataCollection() {
+            console.log('🛑 停止收集数据');
+            console.log('当前dataCollectionInterval:', dataCollectionInterval);
+            console.log('当前segmentDetectionInterval:', segmentDetectionInterval);
+            console.log('当前realtimeDetectionInterval:', realtimeDetectionInterval);
+
+            // 停止数据收集定时器
+            if (dataCollectionInterval) {
+                console.log('清除dataCollectionInterval');
+                clearInterval(dataCollectionInterval);
+                dataCollectionInterval = null;
+            }
+
+            // 停止分段检测定时器
+            if (segmentDetectionInterval) {
+                console.log('清除segmentDetectionInterval');
+                clearInterval(segmentDetectionInterval);
+                segmentDetectionInterval = null;
+            }
+
+            // 停止实时检测定时器
+            if (realtimeDetectionInterval) {
+                console.log('清除realtimeDetectionInterval');
+                clearInterval(realtimeDetectionInterval);
+                realtimeDetectionInterval = null;
+            }
+
+            // 停止实时传感器显示定时器
+            if (realtimeSensorDisplayInterval) {
+                console.log('清除realtimeSensorDisplayInterval');
+                clearInterval(realtimeSensorDisplayInterval);
+                realtimeSensorDisplayInterval = null;
+            }
+            isCollectingData = false;
+
+            const startCollectionBtn = document.getElementById('startCollectionBtn');
+            const stopCollectionBtn = document.getElementById('stopCollectionBtn');
+            const collectionStatus = document.getElementById('collectionStatus');
+            if (startCollectionBtn) {
+                startCollectionBtn.disabled = false;
+                startCollectionBtn.style.cursor = 'pointer';
+                startCollectionBtn.style.opacity = '1';
+            }
+            if (stopCollectionBtn) {
+                stopCollectionBtn.disabled = true;
+                stopCollectionBtn.style.cursor = 'not-allowed';
+                stopCollectionBtn.style.opacity = '0.6';
+            }
+            if (collectionStatus) {
+                collectionStatus.textContent = '状态: 已停止';
+            }
+
+            console.log('✅ 所有定时器已清除');
+            console.log('收集到的数据点数量:', collectedSensorData.length);
+            console.log('当前分段数据点数量:', currentSegmentData.length);
+
+            // 🔥 修复：只使用最后一个时间点的数据进行检测
+            // 避免使用历史数据导致错误的突变检测和多传感器显示
+            if (currentSegmentData.length > 0) {
+                console.log('📊 处理最后一个时间点的数据');
+                updateCNNStatus('detecting', '正在分析最后一段数据...');
+
+                // 只取最后一个时间点的数据
+                const lastData = currentSegmentData[currentSegmentData.length - 1];
+                console.log('🔥 使用最后一个时间点的数据:', lastData);
+
+                try {
+                    const results = await performCNNDetection(lastData);
+                    console.log('最后分段检测结果:', results);
+                    if (results) {
+                        console.log('✅ 检测结果已添加到历史记录，当前allDetectionResults长度:', allDetectionResults.length);
+                    }
+                } catch (error) {
+                    console.error('最后分段检测出错:', error);
+                }
+            } else if (collectedSensorData.length > 0) {
+                // 如果currentSegmentData为空但collectedSensorData有数据，使用collectedSensorData的最后一个数据点
+                console.log('📊 处理最后一个时间点的数据（来自collectedSensorData）');
+                const lastData = collectedSensorData[collectedSensorData.length - 1];
+                console.log('🔥 使用最后一个时间点的数据:', lastData);
+                updateCNNStatus('detecting', '正在分析最后一段数据...');
+
+                try {
+                    const results = await performCNNDetection(lastData);
+                    console.log('最后分段检测结果:', results);
+                    if (results) {
+                        console.log('✅ 检测结果已添加到历史记录，当前allDetectionResults长度:', allDetectionResults.length);
+                    }
+                } catch (error) {
+                    console.error('最后分段检测出错:', error);
+                }
+            } else {
+                console.warn('⚠️ 没有数据可以进行最后检测');
+            }
+
+            // 清空数据
+            currentSegmentData = [];
+            collectedSensorData = [];
+
+            updateCNNStatus('loaded', '检测完成');
+            if (allDetectionResults.length === 0) {
+                console.warn('⚠️ allDetectionResults为空，无法显示检测结果');
+                const resultsDiv = document.getElementById('cnnDetectionResults');
+                if (resultsDiv) {
+                    resultsDiv.innerHTML = '<div style="color: #666; text-align: center;">暂无检测结果</div>';
+                }
+            }
+        }
+
+        // 添加检测结果到历史记录
+        function addDetectionToHistory(results) {
+            const historyDiv = document.getElementById('cnnDetectionHistory');
+            if (!historyDiv || !results) return;
+
+            const timestamp = new Date().toLocaleTimeString('zh-CN');
+            let resultText = '';
+
+            if (results.count === 0) {
+                resultText = '无缺陷';
+            } else {
+                resultText = results.detections.map(det =>
+                    `${det.className} (${(det.confidence * 100).toFixed(1)}%)`
+                ).join(', ');
+            }
+
+            // 添加到allDetectionResults数组用于分页显示
+            allDetectionResults.push({
+                timestamp: timestamp,
+                segmentNumber: detectionSegmentCount,
+                results: results,
+                resultText: resultText,
+                timeValue: Date.now()
+            });
+            if (allDetectionResults.length > MAX_DETECTION_HISTORY) {
+                allDetectionResults.splice(0, allDetectionResults.length - MAX_DETECTION_HISTORY);
+            }
+
+            // 显示最新的检测结果
+            currentResultPage = allDetectionResults.length - 1;
+            currentHistoryPage = 1;
+            displayDetectionResults();
+            updateHistoryDisplay();
+        }
+
+        // 更新检测进度显示
+        // 导出检测历史为JSON
+        function exportDetectionHistory() {
+            if (allDetectionResults.length === 0) {
+                alert('暂无检测记录可导出');
+                return;
+            }
+
+            const exportData = {
+                exportTime: new Date().toLocaleString('zh-CN'),
+                detectionInterval: detectionInterval + 'ms',
+                totalSegments: allDetectionResults.length,
+                records: allDetectionResults
+            };
+
+            const dataStr = JSON.stringify(exportData, null, 2);
+            const dataBlob = new Blob([dataStr], { type: 'application/json' });
+            const url = URL.createObjectURL(dataBlob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `detection_history_${new Date().getTime()}.json`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            console.log('✅ 检测历史已导出');
+        }
+
+        // 导出检测历史为CSV
+        function exportDetectionHistoryCSV() {
+            if (allDetectionResults.length === 0) {
+                alert('暂无检测记录可导出');
+                return;
+            }
+
+            let csv = '时间,分段号,检测结果,置信度\n';
+            allDetectionResults.forEach(record => {
+                const results = record.results;
+                const confidence = results && results.detections && results.detections.length > 0 ? results.detections[0].confidence : 0;
+                csv += `"${record.timestamp}",${record.segmentNumber},"${record.resultText}",${confidence.toFixed(3)}\n`;
+            });
+
+            const dataBlob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(dataBlob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `detection_history_${new Date().getTime()}.csv`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            console.log('✅ 检测历史已导出为CSV');
+        }
+
+        // 清空检测历史
+        function clearDetectionHistory() {
+            if (confirm('确定要清空所有检测历史吗？')) {
+                const historyDiv = document.getElementById('cnnDetectionHistory');
+                if (historyDiv) {
+                    historyDiv.innerHTML = '<div style="color: #666; text-align: center; transition: all 0.3s ease;">暂无检测记录</div>';
+                }
+                allDetectionResults = [];
+                currentResultPage = 0;
+                currentHistoryPage = 1;
+                displayDetectionResults();
+                updateHistoryDisplay();
+                console.log('✅ 检测历史已清空');
+            }
+        }
+
+        // 分页显示检测结果
+        function displayDetectionResults() {
+            const resultsDiv = document.getElementById('cnnDetectionResults');
+            if (!resultsDiv) {
+                console.error('cnnDetectionResults元素不存在');
+                return;
+            }
+            if (allDetectionResults.length === 0) {
+                resultsDiv.innerHTML = '<div style="color: #666; text-align: center;">暂无检测结果</div>';
+                const pageInfo = document.getElementById('pageInfo');
+                const prevPageBtn = document.getElementById('prevPageBtn');
+                const nextPageBtn = document.getElementById('nextPageBtn');
+                const jumpPageInput = document.getElementById('jumpPageInput');
+                if (pageInfo) pageInfo.textContent = '0/0';
+                if (prevPageBtn) {
+                    prevPageBtn.disabled = true;
+                    prevPageBtn.style.opacity = '0.5';
+                }
+                if (nextPageBtn) {
+                    nextPageBtn.disabled = true;
+                    nextPageBtn.style.opacity = '0.5';
+                }
+                if (jumpPageInput) {
+                    jumpPageInput.max = 0;
+                    jumpPageInput.placeholder = '0';
+                }
+                return;
+            }
+
+            const itemsPerPage = 1;
+            const totalPages = Math.ceil(allDetectionResults.length / itemsPerPage);
+
+            // 确保currentResultPage在有效范围内
+            if (currentResultPage >= totalPages) {
+                currentResultPage = totalPages - 1;
+            }
+            if (currentResultPage < 0) {
+                currentResultPage = 0;
+            }
+
+            const startIndex = currentResultPage * itemsPerPage;
+            const endIndex = Math.min(startIndex + itemsPerPage, allDetectionResults.length);
+            const currentResults = allDetectionResults.slice(startIndex, endIndex);
+
+            let html = '';
+            currentResults.forEach((item, index) => {
+                const results = item.results;
+                const colors = ['#ff6b6b', '#2dd4bf', '#60a5fa', '#f9ca24', '#a78bfa'];
+
+                html += `
+                    <div style="margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid rgba(0, 212, 255, 0.2);">
+                            <div>
+                                <span style="color: #00d4ff; font-weight: bold;">分段 #${item.segmentNumber}</span>
+                                <span style="color: #666; margin-left: 15px;">时间: ${item.timestamp}</span>
+                            </div>
+                            <span style="color: #aaa; font-size: 12px;">第 ${currentResultPage + 1} / ${totalPages} 页</span>
+                        </div>
+                `;
+
+                if (!results) {
+                    html += '<div style="color: #ff6b6b; font-weight: bold;">检测失败</div>';
+                } else if (results.count === 0) {
+                    html += '<div style="color: #2dd4bf; font-weight: bold; padding: 10px; background: rgba(45, 212, 191, 0.1); border-radius: 5px;">无缺陷</div>';
+                } else {
+                    results.detections.forEach((det, detIndex) => {
+                        const color = colors[det.classId % colors.length];
+                        html += `
+                            <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px; margin-bottom: 8px; border-left: 3px solid ${color};">
+                                <div style="font-weight: bold; color: ${color};">${detIndex + 1}. ${det.className}</div>
+                                <div style="font-size: 12px; color: #aaa; margin-top: 4px;">
+                                    置信度: ${(det.confidence * 100).toFixed(1)}%
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+
+                // 显示概率分布
+                if (results && results.probabilities) {
+                    html += '<div style="margin-top: 15px; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 5px;">';
+                    html += '<h4 style="margin-top: 0; color: #2dd4bf;">类别概率分布:</h4>';
+                    results.probabilities.forEach(item => {
+                        const barWidth = (item.confidence * 100).toFixed(0);
+                        const color = colors[item.classId % colors.length];
+
+                        html += `
+                            <div style="margin-bottom: 8px;">
+                                <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
+                                    <span>${item.className}</span>
+                                    <span>${(item.confidence * 100).toFixed(1)}%</span>
+                                </div>
+                                <div style="height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden;">
+                                    <div style="height: 100%; width: ${barWidth}%; background: ${color}; transition: width 0.3s ease;"></div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                }
+
+                html += '</div>';
+            });
+
+            resultsDiv.innerHTML = html;
+
+            // 更新可视化（显示传感器数据）
+            if (currentResults.length > 0) {
+                const currentResult = currentResults[0];
+                if (currentResult && currentResult.results) {
+                    updateCnnVisualization(currentResult.results);
+                }
+            }
+
+            // 更新翻页按钮状态和页码显示
+            const prevPageBtn = document.getElementById('prevPageBtn');
+            const nextPageBtn = document.getElementById('nextPageBtn');
+            const jumpPageInput = document.getElementById('jumpPageInput');
+            const pageInfo = document.getElementById('pageInfo');
+
+            console.log('displayDetectionResults - 更新页码显示:', {
+                currentResultPage,
+                totalPages,
+                pageInfoElement: pageInfo,
+                pageInfoText: `${currentResultPage + 1}/${totalPages}`
+            });
+
+            if (pageInfo) {
+                pageInfo.textContent = `${currentResultPage + 1}/${totalPages}`;
+                console.log('pageInfo已更新为:', pageInfo.textContent);
+            } else {
+                console.error('pageInfo元素未找到');
+            }
+
+            if (prevPageBtn) {
+                prevPageBtn.disabled = currentResultPage === 0;
+                prevPageBtn.style.opacity = currentResultPage === 0 ? '0.5' : '1';
+            }
+            if (nextPageBtn) {
+                nextPageBtn.disabled = currentResultPage >= totalPages - 1;
+                nextPageBtn.style.opacity = currentResultPage >= totalPages - 1 ? '0.5' : '1';
+            }
+            if (jumpPageInput) {
+                jumpPageInput.max = totalPages;
+                jumpPageInput.placeholder = `1-${totalPages}`;
+            }
+        }
+
+        // 旧的 setDetectionInterval 函数已删除，使用上面的新版本
+
+        // 旧的停止收集逻辑（保留以防兼容性问题）
+        // 计算平均数据
+        function calculateAverageData(dataArray) {
+            if (dataArray.length === 0) return [];
+            
+            const dataLength = dataArray[0].length;
+            const avgData = new Array(dataLength).fill(0);
+            const actualCounts = dataArray
+                .map(data => Number.isInteger(data.actualCount) ? data.actualCount : null)
+                .filter(count => count !== null);
+            
+            dataArray.forEach(data => {
+                for (let i = 0; i < dataLength; i++) {
+                    avgData[i] += data[i];
+                }
+            });
+            
+            const result = avgData.map(value => value / dataArray.length);
+            if (actualCounts.length > 0) {
+                result.actualCount = Math.max(...actualCounts);
+            }
+            return result;
+        }
+        
+        // 页面加载完成后绑定事件
+        document.addEventListener('DOMContentLoaded', function(event) {
+            bindCNNEvents();
+            bindAnnotationEvents();
+            renderAnnotationSensorCards();
+            updateAnnotationSensorData();
+            console.log('✅ 1D CNN事件绑定完成');
+            console.log('✅ 实时数据标注功能初始化完成');
+        });
+        
+        // ==================== 实时数据标注与训练功能 ====================
+        
+        // 全局变量
+        let annotationData = [];
+        let collectedData = [];
+        let currentSampleLabel = null; // 当前样本的标注
+        let isCollectingData = false;
+        let isTraining = false;
+        let trainingInterval = null;
+        let classNames = ['无缺陷', '裂纹', '腐蚀', '点蚀', '划痕', '变形', '块状', '柱状'];
+        let classLabels = ['无缺陷', '裂纹', '腐蚀', '点蚀', '划痕', '变形', '块状', '柱状'];
+
+        // 初始化标注统计
+        function initAnnotationStats() {
+            updateAnnotationStats();
+        }
+        
+        // 更新标注统计
+        function updateAnnotationStats() {
+            const counts = [0, 0, 0, 0, 0, 0, 0, 0]; // 8个缺陷类型
+            annotationData.forEach(item => {
+                if (item.label >= 0 && item.label < counts.length) {
+                    counts[item.label]++;
+                }
+            });
+            
+            document.getElementById('totalAnnotated').textContent = annotationData.length;
+            document.getElementById('countClass0').textContent = counts[0]; // 无缺陷
+            document.getElementById('countClass1').textContent = counts[1]; // 裂纹
+            document.getElementById('countClass2').textContent = counts[2]; // 腐蚀
+            document.getElementById('countClass3').textContent = counts[3]; // 点蚀
+            document.getElementById('countClass4').textContent = counts[4]; // 划痕
+            document.getElementById('countClass5').textContent = counts[5]; // 变形
+            document.getElementById('countClass6').textContent = counts[6]; // 块状
+            document.getElementById('countClass7').textContent = counts[7]; // 柱状
+            
+            // 更新收集数据统计
+            document.getElementById('totalCollected').textContent = collectedData.length;
+        }
+        
+        function getAnnotationDisplayDevices() {
+            if (!magneticMonitor || !magneticMonitor.deviceData) {
+                return [];
+            }
+
+            const mapping = magneticMonitor.sensorDisplayMapping || {};
+            const mappingIds = ['display1', 'display2', 'display3']
+                .map(key => mapping[key])
+                .filter(Boolean);
+
+            const allDeviceIds = Object.keys(magneticMonitor.deviceData);
+            const ordered = [];
+
+            mappingIds.forEach(deviceId => {
+                if (magneticMonitor.deviceData[deviceId] && !ordered.includes(deviceId)) {
+                    ordered.push(deviceId);
+                }
+            });
+
+            allDeviceIds.forEach(deviceId => {
+                if (!ordered.includes(deviceId)) {
+                    ordered.push(deviceId);
+                }
+            });
+
+            return ordered;
+        }
+
+        function renderAnnotationSensorCards() {
+            const container = document.getElementById('annotationSensorsContainer');
+            if (!container) return;
+
+            const deviceIds = getAnnotationDisplayDevices();
+            container.innerHTML = '';
+
+            if (deviceIds.length === 0) {
+                container.innerHTML = '<div style="font-size:12px;color:#64748b;">暂无已连接传感器</div>';
+                return;
+            }
+
+            deviceIds.forEach((deviceId, index) => {
+                const device = magneticMonitor.deviceData[deviceId] || {};
+                const name = device.name || `传感器${index + 1}`;
+                const card = document.createElement('div');
+                card.style.cssText = 'background: rgba(255,255,255,0.78); border:1px solid rgba(96,165,250,0.22); border-radius:8px; padding:8px;';
+                const safeDeviceId = `annotation-sensor-${index}`;
+                card.innerHTML = `
+                    <label style="font-size:12px;color:#1e40af;display:block;margin-bottom:4px;">${escapeHtml(name)}</label>
+                    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;">
+                        <div style="text-align:center;"><div style="font-size:10px;color:#888;">X</div><div id="${safeDeviceId}-x" style="font-size:12px;font-weight:bold;color:#0f172a;">--</div></div>
+                        <div style="text-align:center;"><div style="font-size:10px;color:#888;">Y</div><div id="${safeDeviceId}-y" style="font-size:12px;font-weight:bold;color:#0f172a;">--</div></div>
+                        <div style="text-align:center;"><div style="font-size:10px;color:#888;">Z</div><div id="${safeDeviceId}-z" style="font-size:12px;font-weight:bold;color:#0f172a;">--</div></div>
+                    </div>`;
+                container.appendChild(card);
+            });
+        }
+
+        // 更新标注界面的传感器数据
+        function updateAnnotationSensorData() {
+            // 检查是否有活动连接
+            let hasActiveConnection = false;
+
+            try {
+                if (magneticMonitor && magneticMonitor.connections) {
+                    const connectionValues = Object.values(magneticMonitor.connections);
+                    hasActiveConnection = connectionValues.some(conn => conn && conn.connected);
+                }
+            } catch (error) {
+                console.error('检查连接状态时出错:', error);
+                hasActiveConnection = false;
+            }
+
+            renderAnnotationSensorCards();
+            const deviceIds = getAnnotationDisplayDevices();
+
+            deviceIds.forEach((deviceId, index) => {
+                const safeDeviceId = `annotation-sensor-${index}`;
+                const xElement = document.getElementById(`${safeDeviceId}-x`);
+                const yElement = document.getElementById(`${safeDeviceId}-y`);
+                const zElement = document.getElementById(`${safeDeviceId}-z`);
+
+                if (magneticMonitor && hasActiveConnection) {
+                    const sensor = magneticMonitor.deviceData[deviceId] || { xData: [], yData: [], zData: [] };
+                    const x = sensor.xData.length > 0 ? sensor.xData[sensor.xData.length - 1] : 0;
+                    const y = sensor.yData.length > 0 ? sensor.yData[sensor.yData.length - 1] : 0;
+                    const z = sensor.zData.length > 0 ? sensor.zData[sensor.zData.length - 1] : 0;
+
+                    if (xElement) xElement.textContent = x.toFixed(2);
+                    if (yElement) yElement.textContent = y.toFixed(2);
+                    if (zElement) zElement.textContent = z.toFixed(2);
+                } else {
+                    if (xElement) xElement.textContent = '--';
+                    if (yElement) yElement.textContent = '--';
+                    if (zElement) zElement.textContent = '--';
+                }
+            });
+        }
+        
+        // 标注数据
+        function annotateData(label) {
+            if (!magneticMonitor) {
+                alert('请先初始化磁场监测系统');
+                return;
+            }
+            
+            // 检查是否开始接收数据
+            if (!magneticMonitor.isReceivingData) {
+                alert('请先开始接收数据');
+                return;
+            }
+            
+            // 检查是否有实际的ESP32连接
+            let hasEsp32Connection = false;
+            if (magneticMonitor.connections['esp32-bluetooth'] && magneticMonitor.connections['esp32-bluetooth'].connected) {
+                hasEsp32Connection = true;
+            }
+            if (magneticMonitor.connections['esp32-network'] && magneticMonitor.connections['esp32-network'].connected) {
+                hasEsp32Connection = true;
+            }
+            
+            // 只有在有ESP32连接时才创建标注
+            if (!hasEsp32Connection) {
+                alert('请先连接ESP32设备');
+                return;
+            }
+            
+            // 检查是否正在收集数据
+            if (!isCollectingData) {
+                alert('请先开始收集数据');
+                return;
+            }
+            
+            // 检查是否已经有标注
+            if (currentSampleLabel !== null && currentSampleLabel !== label) {
+                // 弹出对话框询问是否要修改标注
+                if (confirm(`当前样本已标注为"${classLabels[currentSampleLabel]}"，是否要修改为"${classLabels[label]}"？`)) {
+                    // 更新标注
+                    currentSampleLabel = label;
+                    showAnnotationMessage(`已修改标注为: ${classLabels[label]}`, 'success');
+                }
+            } else {
+                // 第一次标注
+                currentSampleLabel = label;
+                showAnnotationMessage(`已标注为: ${classLabels[label]}`, 'success');
+            }
+        }
+        
+        // 显示标注消息
+        function showAnnotationMessage(message, type = 'info') {
+            const logContainer = document.getElementById('magneticLogContainer');
+                if (logContainer) {
+                    const timestamp = new Date().toLocaleTimeString();
+                    const logEntry = document.createElement('div');
+                    logEntry.className = 'log-entry';
+                    logEntry.innerHTML = `<span class="log-timestamp">[${timestamp}]</span> <span style="color: ${type === 'success' ? '#2dd4bf' : '#ff6b6b'};">${message}</span>`;
+                    logContainer.appendChild(logEntry);
+                    const maxLogs = magneticMonitor && magneticMonitor.memoryPolicy ? magneticMonitor.memoryPolicy.maxLogEntries : 80;
+                    const excess = logContainer.children.length - maxLogs;
+                    if (excess > 0) {
+                        for (let i = 0; i < excess; i++) {
+                            logContainer.removeChild(logContainer.firstChild);
+                        }
+                    }
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                }
+            }
+        
+        // 保存标注数据到本地存储
+        function saveAnnotationData() {
+            try {
+                localStorage.setItem('annotationData', JSON.stringify(annotationData));
+            } catch (error) {
+                console.error('保存标注数据失败:', error);
+            }
+        }
+        
+        // 加载标注数据从本地存储
+        function loadAnnotationData() {
+            try {
+                const savedData = localStorage.getItem('annotationData');
+                if (savedData) {
+                    annotationData = JSON.parse(savedData);
+                    if (annotationData.length > MAX_ANNOTATION_SAMPLES) {
+                        annotationData = annotationData.slice(-MAX_ANNOTATION_SAMPLES);
+                        saveAnnotationData();
+                    }
+                    updateAnnotationStats();
+                }
+            } catch (error) {
+                console.error('加载标注数据失败:', error);
+            }
+        }
+        
+        // 清除所有标注数据
+        function clearAnnotationData() {
+            if (confirm('确定要删除所有标注样本吗？此操作不可恢复。')) {
+                // 清空标注数据数组
+                annotationData = [];
+                // 从本地存储中删除标注数据
+                localStorage.removeItem('annotationData');
+                // 更新标注统计信息
+                updateAnnotationStats();
+                // 显示成功消息
+                showAnnotationMessage('已删除所有标注样本', 'success');
+            }
+        }
+        
+        // 开始数据收集
+        // 开始模型训练
+        function startModelTraining() {
+            if (isTraining) return;
+            
+            if (annotationData.length < 10) {
+                alert('标注数据不足，请至少标注10个样本');
+                return;
+            }
+            
+            isTraining = true;
+            document.getElementById('startTrainingBtn').disabled = true;
+            document.getElementById('stopTrainingBtn').disabled = false;
+            document.getElementById('trainingStatus').textContent = '状态: 正在训练...';
+            
+            showAnnotationMessage('开始模型训练', 'success');
+            
+            // 模拟训练过程
+            trainingInterval = setInterval(() => {
+                // 这里可以添加实际的训练逻辑
+                // 目前只是模拟训练过程
+            }, 1000);
+            
+            // 保存标注数据到文件
+            saveAnnotationDataToFile();
+            
+            // 模拟训练完成
+            setTimeout(() => {
+                stopModelTraining();
+                showAnnotationMessage('模型训练完成', 'success');
+            }, 5000);
+        }
+        
+        // 停止模型训练
+        function stopModelTraining() {
+            if (!isTraining) return;
+            
+            clearInterval(trainingInterval);
+            isTraining = false;
+            document.getElementById('startTrainingBtn').disabled = false;
+            document.getElementById('stopTrainingBtn').disabled = true;
+            document.getElementById('trainingStatus').textContent = '状态: 已停止';
+        }
+        
+        // 保存标注数据到文件
+        function saveAnnotationDataToFile() {
+            // 创建数据集目录结构
+            const data = JSON.stringify(annotationData, null, 2);
+            const blob = new Blob([data], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `annotation_data_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            showAnnotationMessage('标注数据已保存到文件', 'success');
+        }
+        
+        // 绑定标注事件
+        function bindAnnotationEvents() {
+            // 加载保存的标注数据
+            loadAnnotationData();
+            
+            // 加载保存的传感器显示映射设置
+            loadSensorDisplayMappingSettings();
+            
+            // 绑定数据收集按钮
+            const startCollectionBtn = document.getElementById('startCollectionBtn');
+            const stopCollectionBtn = document.getElementById('stopCollectionBtn');
+            
+            if (startCollectionBtn) {
+                startCollectionBtn.addEventListener('click', startDataCollection);
+            }
+            
+            if (stopCollectionBtn) {
+                stopCollectionBtn.addEventListener('click', stopDataCollection);
+            }
+            
+            // 绑定训练按钮
+            const startTrainingBtn = document.getElementById('startTrainingBtn');
+            const stopTrainingBtn = document.getElementById('stopTrainingBtn');
+            
+            if (startTrainingBtn) {
+                startTrainingBtn.addEventListener('click', startModelTraining);
+            }
+            
+            if (stopTrainingBtn) {
+                stopTrainingBtn.addEventListener('click', stopModelTraining);
+            }
+            
+            // 绑定传感器显示映射设置按钮
+            const sensorDisplayMappingBtn = document.getElementById('sensorDisplayMappingBtn');
+            if (sensorDisplayMappingBtn) {
+                sensorDisplayMappingBtn.addEventListener('click', openSensorDisplayMappingModal);
+            }
+            
+            // 绑定传感器显示映射模态框按钮
+            const closeSensorDisplayMappingModal = document.getElementById('closeSensorDisplayMappingModal');
+            const saveSensorDisplayMapping = document.getElementById('saveSensorDisplayMapping');
+            const resetSensorDisplayMapping = document.getElementById('resetSensorDisplayMapping');
+            
+            if (closeSensorDisplayMappingModal) {
+                closeSensorDisplayMappingModal.addEventListener('click', closeSensorDisplayMappingModalFn);
+            }
+            
+            if (saveSensorDisplayMapping) {
+                saveSensorDisplayMapping.addEventListener('click', saveSensorDisplayMappingFn);
+            }
+            
+            if (resetSensorDisplayMapping) {
+                resetSensorDisplayMapping.addEventListener('click', resetSensorDisplayMappingFn);
+            }
+            
+            // 定期更新传感器数据
+            setInterval(updateAnnotationSensorData, 1000);
+        }
+        
+        // 打开传感器显示映射设置模态框
+        function openSensorDisplayMappingModal() {
+            const modal = document.getElementById('sensorDisplayMappingModal');
+            if (modal) {
+                modal.style.display = 'block';
+                
+                // 设置当前映射值
+                if (magneticMonitor && magneticMonitor.sensorDisplayMapping) {
+                    const mapping = magneticMonitor.sensorDisplayMapping;
+                    
+                    const display1Select = document.getElementById('display1Mapping');
+                    const display2Select = document.getElementById('display2Mapping');
+                    const display3Select = document.getElementById('display3Mapping');
+                    const selects = [display1Select, display2Select, display3Select].filter(Boolean);
+                    const availableIds = Object.keys(magneticMonitor.deviceData || {});
+
+                    selects.forEach(select => {
+                        const currentValue = select.value;
+                        select.innerHTML = '';
+
+                        if (availableIds.length === 0) {
+                            const option = document.createElement('option');
+                            option.value = '';
+                            option.textContent = '暂无已连接传感器';
+                            select.appendChild(option);
+                            select.disabled = true;
+                            return;
+                        }
+
+                        select.disabled = false;
+
+                        availableIds.forEach((deviceId, index) => {
+                            const device = magneticMonitor.deviceData[deviceId] || {};
+                            const option = document.createElement('option');
+                            option.value = deviceId;
+                            option.textContent = device.name || `传感器${index + 1}`;
+                            select.appendChild(option);
+                        });
+
+                        if (currentValue && availableIds.includes(currentValue)) {
+                            select.value = currentValue;
+                        }
+                    });
+                    
+                    if (display1Select && mapping.display1 && availableIds.includes(mapping.display1)) display1Select.value = mapping.display1;
+                    if (display2Select && mapping.display2 && availableIds.includes(mapping.display2)) display2Select.value = mapping.display2;
+                    if (display3Select && mapping.display3 && availableIds.includes(mapping.display3)) display3Select.value = mapping.display3;
+                }
+            }
+        }
+        
+        // 关闭传感器显示映射设置模态框
+        function closeSensorDisplayMappingModalFn() {
+            const modal = document.getElementById('sensorDisplayMappingModal');
+            if (modal) {
+                modal.style.display = 'none';
+            }
+        }
+        
+        // 保存传感器显示映射设置
+        function saveSensorDisplayMappingFn() {
+            if (!magneticMonitor) {
+                alert('磁场监控系统未初始化');
+                return;
+            }
+            
+            const display1Select = document.getElementById('display1Mapping');
+            const display2Select = document.getElementById('display2Mapping');
+            const display3Select = document.getElementById('display3Mapping');
+            
+            if (display1Select && display2Select && display3Select) {
+                if (!display1Select.value && !display2Select.value && !display3Select.value) {
+                    alert('暂无已连接传感器可保存');
+                    return;
+                }
+
+                magneticMonitor.sensorDisplayMapping = {
+                    display1: display1Select.value,
+                    display2: display2Select.value,
+                    display3: display3Select.value
+                };
+                
+                // 保存到本地存储
+                localStorage.setItem('sensorDisplayMapping', JSON.stringify(magneticMonitor.sensorDisplayMapping));
+                
+                // 更新显示
+                updateAnnotationSensorData();
+                
+                alert('传感器显示映射设置已保存');
+                closeSensorDisplayMappingModalFn();
+            }
+        }
+        
+        // 重置传感器显示映射设置
+        function resetSensorDisplayMappingFn() {
+            if (!magneticMonitor) {
+                alert('磁场监控系统未初始化');
+                return;
+            }
+            
+            const availableIds = Object.keys(magneticMonitor.deviceData || {});
+
+            // 重置为当前已连接传感器顺序
+            magneticMonitor.sensorDisplayMapping = {
+                display1: availableIds[0] || null,
+                display2: availableIds[1] || null,
+                display3: availableIds[2] || null
+            };
+            
+            // 保存到本地存储
+            localStorage.setItem('sensorDisplayMapping', JSON.stringify(magneticMonitor.sensorDisplayMapping));
+            
+            // 更新显示
+            updateAnnotationSensorData();
+            
+            alert('传感器显示映射设置已重置为默认值');
+            closeSensorDisplayMappingModalFn();
+        }
+        
+        // 加载传感器显示映射设置
+        function loadSensorDisplayMappingSettings() {
+            try {
+                const savedMapping = localStorage.getItem('sensorDisplayMapping');
+                if (savedMapping && magneticMonitor) {
+                    magneticMonitor.sensorDisplayMapping = JSON.parse(savedMapping);
+                    console.log('已加载传感器显示映射设置:', magneticMonitor.sensorDisplayMapping);
+                }
+            } catch (error) {
+                console.error('加载传感器显示映射设置失败:', error);
+            }
+        }
+    
